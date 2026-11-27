@@ -101,6 +101,32 @@ export const generateUsername = async (
 };
 
 /**
+ * A free username made from an email address's local part (jane.doe@example.com
+ * -> jane_doe, then jane_doe2, ...), or null when it gives nothing usable
+ * (empty, reserved like "admin") or every try is taken.
+ */
+export const usernameFromEmail = async (
+    stores: UsernameStores,
+    email: string,
+): Promise<string | null> => {
+    const base = String(email || '')
+        .split('@')[0]
+        .split('+')[0]
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/\W+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, USERNAME_MAX_LENGTH - 2);
+    if (!base || usernameRejection(base)) return null;
+    for (let n = 1; n < 100; n++) {
+        const candidate = n === 1 ? base : `${base}${n}`;
+        if (!(await usernameConflict(stores, candidate))) return candidate;
+    }
+    return null;
+};
+
+/**
  * Whether a failed write to user `ownId` (none for an insert) lost `username`
  * to another account. The primary is read because the winner may not have
  * replicated yet.

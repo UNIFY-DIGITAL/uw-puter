@@ -28,6 +28,7 @@ import {
     isUsernameTaken,
     USERNAME_MAX_LENGTH,
     usernameConflict,
+    usernameFromEmail,
     usernameRejection,
 } from './username.js';
 import { generateDefaultFsentries } from './userProvisioning.js';
@@ -189,5 +190,27 @@ describe('isUsernameTaken', () => {
                 holder.username,
             ),
         ).toBe(false);
+    });
+});
+
+// Unify Works (see MODIFICATIONS.md)
+describe('usernameFromEmail', () => {
+    it('names an account after the address, without dots, tags or accents', async () => {
+        const local = freeName();
+        expect(
+            await usernameFromEmail(server.stores, `${local}.Doé+news@example.com`),
+        ).toBe(`${local}_doe`);
+    });
+
+    it('adds a number when the name is taken', async () => {
+        const user = await makeUser();
+        expect(
+            await usernameFromEmail(server.stores, `${user.username}@example.com`),
+        ).toBe(`${user.username}2`);
+    });
+
+    it('gives nothing for a reserved or empty name', async () => {
+        expect(await usernameFromEmail(server.stores, 'admin@example.com')).toBeNull();
+        expect(await usernameFromEmail(server.stores, '...@example.com')).toBeNull();
     });
 });

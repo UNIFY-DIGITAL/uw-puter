@@ -24,7 +24,7 @@ import { isOwnedEmailConflict } from '../../stores/user/UserStore.js';
 import { PuterService } from '../types';
 import { signupClientIp } from '../user/SignupService.js';
 import { cleanEmail, isStorableEmail } from '../../util/email.js';
-import { generateUsername } from '../../util/username.js';
+import { generateUsername, usernameFromEmail } from '../../util/username.js';
 import { provisionUser } from '../../util/userProvisioning.js';
 import { Context } from '../../core';
 import { HttpError } from '../../core/http/HttpError.js';
@@ -543,7 +543,11 @@ export class OIDCService extends PuterService {
             };
         }
 
-        const username = await generateUsername(this.stores);
+        // Named after the address (jane.doe@ -> jane_doe), not a random name
+        // like a guest's; random when the address gives nothing usable.
+        const username =
+            (await usernameFromEmail(this.stores, email)) ??
+            (await generateUsername(this.stores));
         if (!username) {
             return {
                 success: false,
