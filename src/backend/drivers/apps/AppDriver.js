@@ -19,6 +19,7 @@
 
 import { actorOwnsRow, requireContextActor } from '../../core/actor.js';
 import { HttpError } from '../../core/http/HttpError.js';
+import { assertMayPublish } from '../../util/publishGate.js';
 import { subdomainLabelOf } from '../../core/http/middleware/hostRedirects.js';
 import { extensionStore } from '../../extensions.js';
 import {
@@ -198,6 +199,7 @@ export class AppDriver extends PuterDriver {
         }
         const actor = requireContextActor();
         this.#requireUserOrAppActor(actor);
+        await assertMayPublish(this.clients.event, actor, 'app', 'create');
 
         const fields = await this.#validateInput(object, { isCreate: true });
 
@@ -407,6 +409,7 @@ export class AppDriver extends PuterDriver {
         }
         const actor = requireContextActor();
         this.#requireUserOrAppActor(actor);
+        await assertMayPublish(this.clients.event, actor, 'app', 'update');
 
         const app = await this.#resolve({ uid, id });
         if (!app)

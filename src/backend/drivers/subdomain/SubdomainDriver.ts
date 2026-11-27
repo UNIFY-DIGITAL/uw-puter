@@ -30,6 +30,7 @@ import {
     requireContextUserActor,
     type Actor,
 } from '../../core/actor.js';
+import { assertMayPublish } from '../../util/publishGate.js';
 import type { DriverRateLimitConfig } from '../meta.js';
 import { CRUD_CONCURRENT } from '../util/crudLimits.js';
 import type { FSEntry } from '../../stores/fs/FSEntry.js';
@@ -143,6 +144,7 @@ export class SubdomainDriver extends PuterDriver {
         }
         const actor = requireContextUserActor();
         assertActorEmailVerified(actor, this.config);
+        await assertMayPublish(this.clients.event, actor, 'website', 'create');
 
         const subdomain = this.#validateSubdomain(object.subdomain);
 
@@ -347,6 +349,7 @@ export class SubdomainDriver extends PuterDriver {
         }
         const actor = requireContextUserActor();
         assertActorEmailVerified(actor, this.config);
+        await assertMayPublish(this.clients.event, actor, 'website', 'update');
 
         const row = await this.#resolve(args);
         if (!row)
