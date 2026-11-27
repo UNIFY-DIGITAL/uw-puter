@@ -67,6 +67,7 @@ import {
     phoneAttemptsKey,
 } from '../../util/cardFallback.js';
 import { sessionCookieFlags } from '../../util/cookieFlags.js';
+import { codeExpired } from '../../util/emailCodes.js';
 import { cleanEmail, isStorableEmail } from '../../util/email.js';
 import { isGodmodeApp } from '../../util/godmodeApps.js';
 import { parsePhone } from '../../util/phone.js';
@@ -1070,7 +1071,8 @@ export class AuthController extends PuterController {
         // the real code.
         if (
             !user.email_confirm_code ||
-            String(user.email_confirm_code) !== String(code)
+            String(user.email_confirm_code) !== String(code) ||
+            codeExpired(this.config, user.email, code)
         ) {
             res.json({
                 email_confirmed: false,

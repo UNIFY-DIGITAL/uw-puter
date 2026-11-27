@@ -648,6 +648,21 @@ export interface IDevWatcherConfig {
  * this is the one reference. Each setting has exactly one key, no aliases.
  */
 interface IConfigOptional {
+    // -- Unify Works (see MODIFICATIONS.md) ----------------------------
+
+    /**
+     * How long an email confirmation code lasts, in minutes (10 by default; 0:
+     * no limit).
+     */
+    email_code_minutes: number;
+    /** Built-in apps (by name) never offered to open a file. */
+    hidden_builtin_apps: string[];
+    /** Email templates' own wording, by template name, in place of Puter's. */
+    email_templates: Record<
+        string,
+        { subject?: string; html?: string; text?: string }
+    >;
+
     // -- Environment / identity --------------------------------------
 
     /** `dev` disables blocked-email checks, opens the browser, etc. */

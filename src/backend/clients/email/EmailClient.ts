@@ -27,6 +27,8 @@ import {
     type EmailTemplate,
     type EmailTemplateName,
 } from './templates';
+import { brandTemplates } from './branding';
+import { noteCodeSent } from '../../util/emailCodes';
 
 /**
  * Attachment shape passed through to the underlying transport. Give either
@@ -137,6 +139,9 @@ export class EmailClient extends PuterClient {
         values: Record<string, unknown> = {},
         options: { replyTo?: string } = {},
     ) {
+        if (template === 'email_verification_code' && values?.code) {
+            noteCodeSent(to, values.code);
+        }
         const compiled = this.compiledTemplates[template];
         if (!compiled) {
             throw new Error(`Unknown email template: ${template}`);
@@ -197,7 +202,7 @@ export class EmailClient extends PuterClient {
         // Widened to the interface: the literal map keeps a distinct type per
         // template, and only some of them carry a `text` part.
         const templates: Record<EmailTemplateName, EmailTemplate> =
-            EMAIL_TEMPLATES;
+            brandTemplates(this.config, EMAIL_TEMPLATES);
         for (const [name, template] of Object.entries(templates)) {
             this.compiledTemplates[name as EmailTemplateName] = {
                 // Subjects are plain-text headers: HTML-escaping would put
