@@ -234,7 +234,8 @@ describe('normalize_single_message tool_calls', () => {
             },
         ] as never);
         expect(result[0].content).toEqual([
-            { type: 'tool_use', id: 'c1', name: 'lookup', input: '{}' },
+            // Arguments are read as the object they encode, not kept as a string.
+            { type: 'tool_use', id: 'c1', name: 'lookup', input: {} },
         ]);
     });
 

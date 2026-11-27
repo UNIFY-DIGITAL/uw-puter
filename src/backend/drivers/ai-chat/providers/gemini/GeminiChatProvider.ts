@@ -172,9 +172,12 @@ export class GeminiChatProvider extends OpenAICompatProvider {
         };
     }
 
-    protected override preservesToolCallOrder(model: IChatModel) {
-        // Gemini expects parallel calls back in order, signature on the first.
-        return GEMINI_NATIVE_MODELS.has(model.id);
+    protected override preservesToolCallOrder(_model: IChatModel) {
+        // Gemini expects parallel calls back in order, signature on the first:
+        // every Gemini model, not only the native ones. Reversed, the thought
+        // signature Gemini 3 puts on the first call lands on the last, and
+        // Google refuses the request (400).
+        return true;
     }
 
     protected override keepsToolCallExtraContent() {

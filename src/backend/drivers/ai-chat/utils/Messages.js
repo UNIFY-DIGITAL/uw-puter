@@ -89,7 +89,10 @@ export const normalize_single_message = (message, params = {}) => {
                     type: 'tool_use',
                     id: tool_call.id,
                     name: tool_call.function.name,
-                    input: tool_call.function.arguments,
+                    // The OpenAI format carries the arguments as a JSON
+                    // string; kept as a string they are encoded again on the
+                    // way out ("\"{...}\""), which Gemini refuses (400).
+                    input: parseToolArguments(tool_call.function.arguments),
                     // Gemini's thought signature rides here and must be
                     // replayed with the call.
                     ...(tool_call.extra_content
@@ -302,3 +305,16 @@ export const extract_text = (messages) => {
         })
         .join(' ');
 };
+
+/**
+ * A tool call's arguments as an object: the JSON string the OpenAI format
+ * carries is parsed; anything that is not JSON stays as it came.
+ */
+function parseToolArguments(args) {
+    if (typeof args !== 'string') return args;
+    try {
+        return args.trim() ? JSON.parse(args) : {};
+    } catch {
+        return args;
+    }
+}
