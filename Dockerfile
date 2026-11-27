@@ -76,6 +76,11 @@ RUN mkdir -p /etc/puter /var/puter && \
 # Self-hosters mount their override at this exact path. The v2 loader
 # deep-merges it over config.default.json (see backend/index.ts).
 ENV PUTER_CONFIG_PATH=/etc/puter/config.json
+# Modules installed for the backend workspace (sharp, ...) sit in
+# src/backend/node_modules, out of reach of the compiled code in dist/: without
+# this the server stops at "Cannot find module 'sharp'".
+# Unify Works modification (see MODIFICATIONS.md).
+ENV NODE_PATH=/opt/puter/src/backend/node_modules
 ENV NODE_OPTIONS=--enable-source-maps
 
 EXPOSE 4100
