@@ -1,4 +1,27 @@
-<h3 align="center"><img width="80" alt="Puter.com, The Personal Cloud Computer: All your files, apps, and games in one place accessible from anywhere at any time." src="https://assets.puter.site/puter-logo.png"></h3>
+# uw-puter
+
+Unify Works' modified version of [Puter](https://github.com/HeyPuter/puter), the
+open-source internet computer. It is the Puter server and desktop that the
+Unify Works suite runs on.
+
+> **This software is a modified version of Puter software and is not endorsed by Puter Technologies Inc.**
+> Puter is a trademark of Puter Technologies Inc.
+
+- **What we changed, and why:** [MODIFICATIONS.md](MODIFICATIONS.md). Every
+  change is an ordinary commit on the `unify/main` branch, on top of Puter's
+  own history.
+- **Based on:** Puter commit `3160b99f` (HeyPuter/puter).
+- **Licence:** AGPL-3.0, as Puter ([LICENSE.txt](LICENSE.txt)). Puter's
+  copyright and licence notices are kept.
+- **Running it:** as Puter: [doc/self-hosting.md](doc/self-hosting.md), with
+  this repository's image (`docker build -t uw-puter .`) in place of
+  `ghcr.io/heyputer/puter`. Without further settings it behaves as Puter does.
+
+---
+
+*Puter's own README follows (its logo images removed, as Puter's trademark
+policy asks of modified versions).*
+
 
 <h3 align="center">The Open-Source Internet Computer!</h3>
 
@@ -17,7 +40,6 @@
     <a href="https://twitter.com/HeyPuter">X</a>
 </p>
 
-<h3 align="center"><img width="800" style="border-radius:5px;" alt="screenshot" src="https://assets.puter.site/puter.com-screenshot.webp"></h3>
 
 <br/>
 
