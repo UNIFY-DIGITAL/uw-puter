@@ -4,10 +4,10 @@ This software is a modified version of Puter software and is not endorsed by
 Puter Technologies Inc.
 
 This file lists how this repository (UNIFY-DIGITAL/uw-puter, branch
-`unify/main`) differs from Puter (HeyPuter/puter, commit `3160b99f`), as the
-AGPL-3.0 (section 5a) asks. The commits on `unify/main` after `3160b99f` hold
-the exact changes; files we added or changed carry a "Unify Works
-modification" note.
+`unify/main`) differs from Puter (HeyPuter/puter, release `26.11`), as the
+AGPL-3.0 (section 5a) asks. Comparing `26.11...unify/main` shows the exact
+changes. Puter's files we changed say "Modified by Unify Works" under their
+copyright line; files we added carry a "Unify Works modification" note.
 
 Every change keeps Puter's behaviour unless its setting is given, except the
 fixes marked *fix*, which apply to everyone.
@@ -24,5 +24,5 @@ fixes marked *fix*, which apply to everyone.
 | 2026-11-27 | *fix* Gemini gets a turn's tool calls back in the order it made them (its thought signature rides on the first) | `src/backend/drivers/ai-chat/providers/gemini/GeminiChatProvider.ts` | – |
 | 2026-11-27 | *fix* Tool-call arguments an app sends back are read as an object, not encoded twice (Gemini refuses that) | `src/backend/drivers/ai-chat/utils/Messages.js` | – |
 | 2026-11-27 | A server can decide who may create or change websites and apps: the `publish.validate` event, which an extension may refuse | `src/backend/util/publishGate.ts`, `src/backend/drivers/subdomain/SubdomainDriver.ts`, `src/backend/drivers/apps/AppDriver.js` | – (no listener: everyone may, as in Puter) |
-| 2026-11-27 | *fix* The Docker image finds the backend's modules (`sharp`), so the server starts | `Dockerfile` | – |
+| 2026-11-27 | Puter's logos replaced by Unify Works' (desktop logo, favicons and app icons, the SDK's sign-in dialog), as Puter's trademark policy asks of modified versions; the README describes Unify Works | `src/gui/src/icons/logo*.svg`, `src/gui/src/images/logo.png`, `src/gui/src/favicons/`, `src/gui/src/favicon.ico`, `src/puter-js/src/modules/PuterDialog.js`, `README.md` | – |
 | 2026-11-27 | The settings above, in the configuration's type | `src/backend/types.ts` | – |
