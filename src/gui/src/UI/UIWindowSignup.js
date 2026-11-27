@@ -57,7 +57,8 @@ function UIWindowSignup(options) {
     options = options ?? {};
     options.reload_on_success = options.reload_on_success ?? true;
     options.has_head = options.has_head ?? true;
-    options.send_confirmation_code = options.send_confirmation_code ?? false;
+    // The window that follows asks for a code (UIWindowEmailConfirmationRequired), so ask for one.
+    options.send_confirmation_code = options.send_confirmation_code ?? true;
     options.show_close_button = options.show_close_button ?? true;
     if (options.redirect_url === undefined) {
         // stay on the page the signup started from (e.g. an /app/<name>

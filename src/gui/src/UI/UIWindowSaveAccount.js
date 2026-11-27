@@ -24,7 +24,8 @@ async function UIWindowSaveAccount (options) {
     const internal_id = window.uuidv4();
     options = options ?? {};
     options.reload_on_success = options.reload_on_success ?? false;
-    options.send_confirmation_code = options.send_confirmation_code ?? false;
+    // The window that follows asks for a code (UIWindowEmailConfirmationRequired), so ask for one.
+    options.send_confirmation_code = options.send_confirmation_code ?? true;
 
     return new Promise(async (resolve) => {
         let h = '';

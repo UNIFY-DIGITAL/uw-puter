@@ -2077,7 +2077,7 @@ window.initgui = async function (options) {
             });
             if (alert_resp === 'save_account') {
                 let saved = await UIWindowSaveAccount({
-                    send_confirmation_code: false,
+                    send_confirmation_code: true,
                     default_username: window.user.username,
                 });
                 if (saved) {
