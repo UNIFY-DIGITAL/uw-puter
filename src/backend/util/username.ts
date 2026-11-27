@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2024-present Puter Technologies Inc.
+ * Modified by Unify Works, 2026-11 (see MODIFICATIONS.md).
  *
  * This file is part of Puter.
  *
