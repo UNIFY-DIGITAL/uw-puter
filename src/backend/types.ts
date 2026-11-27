@@ -652,8 +652,8 @@ interface IConfigOptional {
     // -- Unify Works (see MODIFICATIONS.md) ----------------------------
 
     /**
-     * How long an email confirmation code lasts, in minutes (10 by default; 0:
-     * no limit).
+     * How long an email confirmation code lasts, in minutes (unset or 0: no
+     * limit, as in Puter).
      */
     email_code_minutes: number;
     /** Built-in apps (by name) never offered to open a file. */

@@ -18,7 +18,7 @@ fixes marked *fix*, which apply to everyone.
 | 2026-11-27 | Homepage: the page's author is the server's company | `src/backend/controllers/homepage/HomepageController.ts` | `gui_params.company`, `gui_params.brand_name` |
 | 2026-11-27 | *fix* Sign-up asks for the confirmation code the window that follows expects, not a link | `src/gui/src/UI/UIWindowSignup.js`, `UIWindowSaveAccount.js`, `initgui.js` | – |
 | 2026-11-27 | Sign-ups through Google, Microsoft or Apple are named after their email address (jane.doe@ -> jane_doe), not a random name | `src/backend/util/username.ts`, `src/backend/services/auth/OIDCService.ts` | – |
-| 2026-11-27 | Email confirmation codes expire | `src/backend/util/emailCodes.ts`, `src/backend/clients/email/EmailClient.ts`, `src/backend/controllers/auth/AuthController.ts` | `email_code_minutes` (10; 0: never) |
+| 2026-11-27 | Email confirmation codes expire | `src/backend/util/emailCodes.ts`, `src/backend/clients/email/EmailClient.ts`, `src/backend/controllers/auth/AuthController.ts` | `email_code_minutes` (unset or 0: never, as Puter) |
 | 2026-11-27 | The server's emails carry its brand, support address and links, and its own wording per template | `src/backend/clients/email/branding.ts`, `EmailClient.ts` | `gui_params.brand_name`, `support_email`, `email_templates` |
 | 2026-11-27 | An app marked as the preferred opener opens its file types first; listed built-in apps are never offered | `src/backend/services/apps/SuggestedAppsService.ts` | app `metadata.preferred_opener`, `hidden_builtin_apps` |
 | 2026-11-27 | *fix* Gemini gets a turn's tool calls back in the order it made them (its thought signature rides on the first) | `src/backend/drivers/ai-chat/providers/gemini/GeminiChatProvider.ts` | – |

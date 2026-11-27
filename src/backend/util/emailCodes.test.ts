@@ -20,10 +20,11 @@ describe('email confirmation codes', () => {
     });
 
     it('refuses a code it never saw sent (sent before a restart)', () => {
-        expect(codeExpired({}, 'nobody@example.com', '654321')).toBe(true);
+        expect(codeExpired({ email_code_minutes: 10 }, 'nobody@example.com', '654321')).toBe(true);
     });
 
-    it('never expires a code when the lifetime is 0', () => {
+    it('never expires a code without a lifetime (as Puter), or with 0', () => {
+        expect(codeExpired({}, 'nobody@example.com', '654321')).toBe(false);
         expect(
             codeExpired({ email_code_minutes: 0 }, 'x@example.com', '1'),
         ).toBe(false);

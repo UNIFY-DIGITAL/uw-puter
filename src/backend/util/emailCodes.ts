@@ -3,8 +3,8 @@
  * expire.
  *
  * Puter's codes never expire. The send time of each code is kept in memory,
- * by address and code; one older than config `email_code_minutes`
- * (10 by default; 0: no limit, Puter's behaviour) is refused like a wrong one.
+ * by address and code; one older than config `email_code_minutes` is refused
+ * like a wrong one. Unset or 0: codes never expire, as in Puter.
  * After a restart, earlier codes count as expired: the person asks for a new one.
  */
 
@@ -29,7 +29,7 @@ export function codeExpired(
     email: unknown,
     code: unknown,
 ): boolean {
-    const minutes = Number(config.email_code_minutes ?? 10);
+    const minutes = Number(config.email_code_minutes ?? 0);
     if (!(minutes > 0)) return false;
     const at = sent.get(key(email, code));
     return !at || Date.now() - at > minutes * 60 * 1000;
