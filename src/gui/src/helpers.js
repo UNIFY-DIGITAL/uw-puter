@@ -18,6 +18,7 @@
  */
 
 import { createUploadThumbnailGenerator } from './services/pdfThumbnails/index.js';
+import { dedupedName } from './helpers/dedupedName.js';
 import { archiveEntryPath } from './helpers/archiveEntryPath.js';
 import get_html_element_from_options from './helpers/getHtmlElementFromOptions.js';
 import globToRegExp from './helpers/globToRegExp.js';
@@ -147,7 +148,43 @@ window.handle401 = (xhrOrBody) => {
         window.handleReauthRequired({ reason: body.reason, auth_id: body.auth_id });
         return;
     }
-    window.logout();
+    // A fresh session that still gets 401s is signed out for real.
+    if ( window.local_sign_out_was_recent() ) {
+        window.logout();
+        return;
+    }
+    window.sign_out_locally();
+};
+
+const LOCAL_SIGN_OUT_AT_KEY = 'puter.local_sign_out_at';
+const LOCAL_SIGN_OUT_RECENT_MS = 60 * 1000;
+
+window.local_sign_out_was_recent = () => {
+    try {
+        const at = Number(sessionStorage.getItem(LOCAL_SIGN_OUT_AT_KEY));
+        return at > 0 && Date.now() - at < LOCAL_SIGN_OUT_RECENT_MS;
+    } catch ( e ) {
+        return false;
+    }
+};
+
+/**
+ * Drops this tab's token and user without ending the session on the server.
+ * The reload signs the tab back in from the session cookie when it still
+ * holds, so a token the server stopped accepting costs nothing but a reload.
+ */
+window.sign_out_locally = () => {
+    try { sessionStorage.setItem(LOCAL_SIGN_OUT_AT_KEY, String(Date.now())); } catch ( e ) { /* ignore */ }
+    try { puter._cache.flushall(); } catch ( e ) { /* ignore */ }
+    try {
+        localStorage.removeItem(window.AUTH_TOKEN_KEY_V2);
+        localStorage.removeItem(window.AUTH_TOKEN_KEY_RETIRED);
+        localStorage.removeItem('user');
+    } catch ( e ) { /* ignore */ }
+    window.auth_token = null;
+    window.user = null;
+    window.onbeforeunload = null;
+    window.location.reload();
 };
 
 window.suggest_apps_for_fsentry = async (options) => {
@@ -819,9 +856,9 @@ if ( typeof window !== 'undefined' && window.addEventListener ) {
                 window.location.reload();
             }
         } else {
-            // A peer tab signed out. Mirror that locally as a soft logout.
+            // A peer tab signed out; it already ended the session if it meant to.
             if ( ! window._reauthInProgress ) {
-                window.logout();
+                window.sign_out_locally();
             }
         }
     });
@@ -1961,14 +1998,17 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                     });
                 }
 
+                // The dashboard's Back/Forward follows a moved folder, and
+                // forgets a trashed one.
+                if ( $(el_item).attr('data-is_dir') === '1' ) {
+                    window.dashboard_object?.folderMoved?.($(el_item).attr('data-path'), is_trashing ? null : fsentry.path);
+                }
+
                 if ( is_trashing ) {
                     // if trashing dir...
                     if ( $(el_item).attr('data-is_dir') === '1' ) {
-                        // disassociate all its websites
-                        // todo, some client-side check to see if this dir has at least one associated website before sending ajax request
-                        // FIXME: dir_uuid is not defined, is this the same as the data-uid attribute?
-                        // puter.hosting.delete(dir_uuid)
-
+                        // Its websites stay registered: the server doesn't
+                        // serve a root in Trash, and restoring brings them back.
                         $(`.mywebsites-dir-path[data-uuid="${$(el_item).attr('data-uid')}"]`).remove();
                         // remove the website badge from all instances of the dir
                         $(`.item[data-uid="${$(el_item).attr('data-uid')}"]`).find('.item-has-website-badge').fadeOut(300);
@@ -2159,10 +2199,13 @@ window.refresh_desktop_background = function () {
 };
 
 window.determine_website_url = function (fsentry_path) {
-    // search window.sites and if any site has `dir_path` set and the fsentry_path starts with that dir_path + '/', return the site's url + path
-    for ( let i = 0; i < window.sites.length; i++ ) {
-        if ( window.sites[i].dir_path && fsentry_path.startsWith(`${window.sites[i].dir_path }/`) ) {
-            return window.sites[i].address + fsentry_path.replace(window.sites[i].dir_path, '');
+    // The address an item has under a site serving a folder above it. The
+    // site's folder and address come with its root_dir.
+    for ( const site of window.sites ) {
+        const dir_path = site.root_dir?.path;
+        const address = site.root_dir?.subdomains?.find((entry) => entry.subdomain === site.subdomain)?.address;
+        if ( dir_path && address && fsentry_path.startsWith(`${dir_path}/`) ) {
+            return address + fsentry_path.slice(dir_path.length);
         }
     }
 
@@ -2631,7 +2674,10 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
         progwin?.set_status(i18n('zip', 'Selection(s)'));
     }, 500);
 
-    let toBeZipped = {};
+    const toBeZipped = {};
+    // Shared items from different people can share a name; each keeps its
+    // own entry rather than overwriting the other.
+    const topNames = [];
 
     let perItemAdditionProgress = window.zippingProgressConfig.SEQUENCING / el_items.length;
     let currentProgress = 0;
@@ -2639,6 +2685,8 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
         const el_item = el_items[idx];
         if ( window.operation_cancelled[zip_operation_id] ) return;
         let targetPath = $(el_item).attr('data-path');
+        const topName = dedupedName(path.basename(targetPath), topNames);
+        topNames.push(topName);
 
         // if directory, zip the directory
         if ( $(el_item).attr('data-is_dir') === '1' ) {
@@ -2650,12 +2698,10 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
             for ( let cIdx = 0; cIdx < children.length; cIdx++ ) {
                 const child = children[cIdx];
 
-                if ( ! child.relativePath ) {
-                    // Add empty directiories to the zip
-                    toBeZipped = {
-                        ...toBeZipped,
-                        [`${path.basename(child.path)}/`]: [await blobToUint8Array(new Blob()), { level: 9 }],
-                    };
+                if ( child.emptyDirPath !== undefined ) {
+                    // Add empty directories to the zip, where they sit
+                    const dirPath = el_items.length === 1 ? child.emptyDirPath : `${topName}/${child.emptyDirPath}`;
+                    toBeZipped[dirPath || `${topName}/`] = [await blobToUint8Array(new Blob()), { level: 9 }];
                 } else {
                     // Add files from directory to the zip
                     let relativePath;
@@ -2665,17 +2711,14 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
                     }
                     else
                     {
-                        relativePath = `${path.basename(targetPath) }/${ child.relativePath}`;
+                        relativePath = `${topName}/${child.relativePath}`;
                     }
 
                     // read file content
                     progwin?.set_status(i18n('sequencing', child.relativePath));
                     let content = await puter.fs.read(child.path);
                     try {
-                        toBeZipped = {
-                            ...toBeZipped,
-                            [relativePath]: [await blobToUint8Array(content), { level: 9 }],
-                        };
+                        toBeZipped[relativePath] = [await blobToUint8Array(content), { level: 9 }];
                     } catch (e) {
                         console.error(e);
                     }
@@ -2688,10 +2731,7 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
         else {
             progwin?.set_status(i18n('reading', path.basename($(el_items[0]).attr('data-path'))));
             let content = await puter.fs.read(targetPath);
-            toBeZipped = {
-                ...toBeZipped,
-                [path.basename(targetPath)]: [await blobToUint8Array(content), { level: 9 }],
-            };
+            toBeZipped[topName] = [await blobToUint8Array(content), { level: 9 }];
             currentProgress += perItemAdditionProgress;
             progwin?.set_progress(currentProgress.toPrecision(2));
         }
@@ -2762,7 +2802,8 @@ async function readDirectoryRecursive (path, baseDir = '') {
     const entries = await puter.fs.readdir(path, { consistency: 'eventual' });
 
     if ( entries.length === 0 ) {
-        allFiles.push({ path });
+        // An empty folder, by where it sits in the folder being read.
+        allFiles.push({ path, emptyDirPath: baseDir });
     } else {
         // Process each entry
         for ( const entry of entries ) {
@@ -3304,11 +3345,12 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
 
             onDone?.(null);
 
-            //show error
-            if ( err.message ) {
-                UIAlert(err.message);
-            }
+            // A network failure rejects with no message, and the name going
+            // back on its own would look like the rename was ignored.
+            UIAlert(err?.message || i18n('error_unknown_cause', [], false));
         },
+    }).catch(() => {
+        // Handled by the error callback above.
     });
 };
 

@@ -198,13 +198,18 @@ const makeApp = async (path: string): Promise<Actor> => {
         uid,
         `fs:${await uidOf(path)}:list`,
     );
-    // Durable rows target the app's worker by default, which takes its own
+    // A row with a handler runs in the app's worker, which takes its own
     // consent.
     await env.server.services.permission.grantUserAppPermission(
         owner.actor,
         uid,
         EVENTS_BACKGROUND_PERMISSION,
     );
+    await env.server.stores.eventHandler.publish({
+        appUid: uid,
+        name: 'onChange',
+        source: 'async () => {}',
+    });
     const app = await env.server.stores.app.getByUid(uid);
     return makeActor({
         user: owner.actor.user as never,
@@ -522,11 +527,14 @@ describe('what a revoked grant settles', () => {
         ).sub;
 
         await write(uniquePath(inner));
+        const lease = `ev:ql:{${sub.subId}}`;
         await vi.waitFor(
-            async () =>
+            async () => {
                 expect(
                     await env.server.stores.pendingDelivery.depth(sub.subId),
-                ).toBeGreaterThan(0),
+                ).toBeGreaterThan(0);
+                expect(await env.server.clients.redis.zcard(lease)).toBe(1);
+            },
             { timeout: 5_000, interval: 25 },
         );
 
@@ -534,6 +542,8 @@ describe('what a revoked grant settles', () => {
         await unshare(shared, 'list');
         expect((await rowOf(sub.subId)).suspended_reason).toBeNull();
 
+        // The first hand-over's lease lapses, and the sweep reads the row.
+        await env.server.clients.redis.del(lease);
         delivered.length = 0;
         await events().sweepPending();
 
@@ -698,14 +708,16 @@ describe('what a revoked grant settles', () => {
         const appActor = await makeApp(path);
 
         const background = (
-            await events().subscribeDurable(appActor, { subject: `fs:${path}` })
+            await events().subscribeDurable(appActor, {
+                subject: `fs:${path}`,
+                handlerName: 'onChange',
+            })
         ).sub;
-        // Delivered to a connection and nowhere else, so the consent that just
-        // went was never what allowed it.
+        // No handler, so it only reaches connections and the consent that
+        // just went was never what allowed it.
         const foreground = (
             await events().subscribeDurable(appActor, {
                 subject: `fs:${path}`,
-                targets: ['socket'],
             })
         ).sub;
 
@@ -729,6 +741,7 @@ describe('what a revoked grant settles', () => {
                 (
                     await events().subscribeDurable(appActor, {
                         subject: `fs:${path}`,
+                        handlerName: 'onChange',
                     })
                 ).sub,
             );

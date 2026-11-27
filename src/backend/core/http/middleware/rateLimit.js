@@ -84,6 +84,10 @@ export function sweepMemoryWindows() {
         )
             memoryWindows.delete(k);
     }
+    for (const [k, entry] of memoryCounters) {
+        if (entry.index < Math.floor(now / entry.windowMs) - 1)
+            memoryCounters.delete(k);
+    }
 }
 
 {
@@ -153,6 +157,97 @@ async function peekMemory(key, limit, windowMs) {
     const timestamps = entry.ts;
     while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
     return timestamps.length < limit;
+}
+
+// -- Counted claims --------------------------------------------------
+//
+// `claim` keeps a member per unit, which is fine for a few units and not for
+// thousands. The counted form keeps two counters per key, the current fixed
+// window and the one before it, and slides by weighting the previous one by
+// how much of it the window still covers. It can be off by a little at window
+// edges, and its buckets are separate from the other forms'.
+
+/** The sliding-window estimate from the two fixed windows it overlaps. */
+const slidingCount = (previous, current, now, windowMs) =>
+    previous * (1 - (now % windowMs) / windowMs) + current;
+
+/** How many of `units` a counted claim that left `used` spent may keep. */
+const countedAdmits = (used, limit, units) =>
+    units - Math.min(units, Math.max(0, Math.ceil(used - limit)));
+
+/** Key → `{ index, current, previous, windowMs }`, swept with the windows. */
+const memoryCounters = new Map();
+
+async function claimCountMemory(key, limit, windowMs, units) {
+    const now = Date.now();
+    const index = Math.floor(now / windowMs);
+    let entry = memoryCounters.get(key);
+    if (!entry) {
+        if (memoryCounters.size >= MEMORY_MAX_KEYS) {
+            memoryCounters.delete(memoryCounters.keys().next().value);
+        }
+        entry = { index, current: 0, previous: 0, windowMs };
+        memoryCounters.set(key, entry);
+    } else if (entry.index !== index) {
+        entry.previous = entry.index === index - 1 ? entry.current : 0;
+        entry.current = 0;
+        entry.index = index;
+    }
+    entry.windowMs = windowMs;
+    const used = slidingCount(entry.previous, entry.current, now, windowMs);
+    const admitted = countedAdmits(used + units, limit, units);
+    entry.current += admitted;
+    return admitted;
+}
+
+async function claimCountRedis(redis, key, limit, windowMs, units) {
+    const now = Date.now();
+    const index = Math.floor(now / windowMs);
+    // The hash tag keeps both windows in one slot, so one MULTI reads both.
+    const current = `ratec:{${key}}:${index}`;
+    const results = await redis
+        .multi()
+        .incrby(current, units)
+        .pexpire(current, 2 * windowMs)
+        .get(`ratec:{${key}}:${index - 1}`)
+        .exec();
+    const used = slidingCount(
+        Number(multiResult(results, 2) ?? 0),
+        Number(multiResult(results, 0)),
+        now,
+        windowMs,
+    );
+    const admitted = countedAdmits(used, limit, units);
+    if (admitted < units) await redis.decrby(current, units - admitted);
+    return admitted;
+}
+
+async function claimCountKv(kv, key, limit, windowMs, units) {
+    const now = Date.now();
+    const index = Math.floor(now / windowMs);
+    const current = `ratec:${key}:${index}`;
+    const [counted, previous] = await Promise.all([
+        kv.incr({
+            key: current,
+            pathAndAmountMap: { '': units },
+            expireAt: Math.ceil((now + 2 * windowMs) / 1000),
+        }),
+        kv.get({ key: `ratec:${key}:${index - 1}` }),
+    ]);
+    const used = slidingCount(
+        Number(previous.res ?? 0),
+        Number(counted.res),
+        now,
+        windowMs,
+    );
+    const admitted = countedAdmits(used, limit, units);
+    if (admitted < units) {
+        await kv.decr({
+            key: current,
+            pathAndAmountMap: { '': units - admitted },
+        });
+    }
+    return admitted;
 }
 
 // -- Redis backend ---------------------------------------------------
@@ -475,6 +570,10 @@ function instrumentBackendPair(name, pair) {
             withSpan('rate_limit.claim', attrs, () =>
                 pair.claim(key, limit, windowMs, units),
             ),
+        count: (key, limit, windowMs, units) =>
+            withSpan('rate_limit.count', attrs, () =>
+                pair.count(key, limit, windowMs, units),
+            ),
         acquire: (key, limit) =>
             withSpan('rate_limit.acquire', attrs, () =>
                 pair.acquire(key, limit),
@@ -486,6 +585,7 @@ const memoryBackendPair = instrumentBackendPair('memory', {
     rate: checkMemory,
     peek: peekMemory,
     claim: claimMemory,
+    count: claimCountMemory,
     acquire: acquireMemoryConcurrent,
 });
 
@@ -536,6 +636,8 @@ export function configureRateLimit({
                 peekRedis(redis, key, limit, windowMs),
             claim: (key, limit, windowMs, units) =>
                 claimRedis(redis, key, limit, windowMs, units),
+            count: (key, limit, windowMs, units) =>
+                claimCountRedis(redis, key, limit, windowMs, units),
             acquire: (key, limit) => acquireRedisConcurrent(redis, key, limit),
         });
     }
@@ -545,6 +647,8 @@ export function configureRateLimit({
             peek: (key, limit) => peekKv(kv, key, limit),
             claim: (key, limit, windowMs, units) =>
                 claimKv(kv, key, limit, windowMs, units),
+            count: (key, limit, windowMs, units) =>
+                claimCountKv(kv, key, limit, windowMs, units),
             acquire: (key, limit) => acquireKvConcurrent(kv, key, limit),
         });
     }
@@ -875,6 +979,32 @@ export async function claimRateLimit(key, limit, windowMs, units, backend) {
 }
 
 /**
+ * `claimRateLimit` for budgets measured in many units per call: a claim costs
+ * the same however many units it spends (see "Counted claims" above). Its
+ * buckets are its own, so a key is only ever claimed one way. Fails open,
+ * admitting every unit.
+ */
+export async function claimCountedRateLimit(
+    key,
+    limit,
+    windowMs,
+    units,
+    backend,
+) {
+    if (!(units > 0)) return 0;
+    const bk = resolveBackend(backend);
+    try {
+        return await bk.count(key, limit, windowMs, units);
+    } catch (err) {
+        console.error(
+            '[rate-limit] imperative counted claim failed, failing open:',
+            err,
+        );
+        return units;
+    }
+}
+
+/**
  * Charge a route-shaped rate-limit spec from inside a handler.
  *
  * `rateLimitGate` takes one static spec per route, which is wrong for a route
@@ -1049,8 +1179,8 @@ export function concurrencyGate(opts) {
  * Acquire a concurrent slot for a driver call. Mirrors `checkDriverRateLimit`
  * but returns an acquisition handle: caller MUST invoke `release()` on the
  * returned object exactly once, even on thrown errors — typically in a
- * `finally`. `ok: false` means the slot was full; callers should reject with
- * 429 in that case.
+ * `finally`. `renew()` keeps a long-held slot past the orphan TTL. `ok: false`
+ * means the slot was full; callers should reject with 429 in that case.
  *
  * `opts` is the resolved per-method spec from the driver's decorator (or
  * imperative `concurrent` field). Omitting `opts` (driver declares nothing)
@@ -1060,7 +1190,7 @@ export function concurrencyGate(opts) {
  */
 export async function acquireDriverConcurrent(req, ifaceName, method, opts) {
     if (!opts || typeof opts.limit !== 'number') {
-        return { ok: true, release: noop };
+        return { ok: true, release: noop, renew: noop };
     }
     const slot = await charge(
         req,
@@ -1072,8 +1202,7 @@ export async function acquireDriverConcurrent(req, ifaceName, method, opts) {
             label: '[concurrent] driver acquire',
         },
     );
-    if (!slot) return { ok: true, release: noop };
-    if (!slot.ok) return { ok: false, release: noop };
-    const { release } = guardSlot(slot, '[concurrent] driver');
-    return { ok: true, release };
+    if (!slot) return { ok: true, release: noop, renew: noop };
+    if (!slot.ok) return { ok: false, release: noop, renew: noop };
+    return guardSlot(slot, '[concurrent] driver');
 }

@@ -60,6 +60,11 @@ import { UserRow } from '../../stores/user/UserStore';
 
 export interface ScanOptions {
     noCache?: boolean;
+    /**
+     * Read user-to-app grants from the primary database, past their cache, and
+     * skip the scan cache: for a "no" that must not trail a grant.
+     */
+    primary?: boolean;
 }
 
 export interface ScanState {
@@ -239,7 +244,10 @@ export class PermissionService extends PuterService {
         permissionOptions: string | string[],
         scanOptions?: ScanOptions,
     ): Promise<boolean> {
-        if (this.#heldByDefault(actor, permissionOptions)) return true;
+        const defaultActor = actor.accessToken?.fullAccess
+            ? actor.accessToken.issuer
+            : actor;
+        if (this.#heldByDefault(defaultActor, permissionOptions)) return true;
         const reading = await this.scan(
             actor,
             permissionOptions,
@@ -432,7 +440,7 @@ export class PermissionService extends PuterService {
             options,
             generation,
         );
-        if (!scanOptions.noCache && !pathScoped) {
+        if (!scanOptions.noCache && !scanOptions.primary && !pathScoped) {
             const cached = await this.stores.permission.getScanCache(cacheKey);
             if (cached) return cached as ReadingNode[];
         }
@@ -552,7 +560,7 @@ export class PermissionService extends PuterService {
                 this.#scanUserUser(actor, options, reading, workingState),
                 this.#scanUserGroup(actor, options, reading, workingState),
                 this.#scanUserAppImplied(actor, options, reading),
-                this.#scanUserApp(actor, options, reading),
+                this.#scanUserApp(actor, options, reading, scanOptions),
                 this.#scanDevApp(actor, options, reading),
             ]);
         }
@@ -626,8 +634,11 @@ export class PermissionService extends PuterService {
         // Account-management endpoints stay closed because they gate on actor
         // type (requireUserActor / session cookie), not permissions.
         if (actor.accessToken.fullAccess) {
-            for (const permission of options) {
-                const issuerReading = await this.scan(issuerActor, permission);
+            const issuerReadings = await Promise.all(
+                options.map((permission) => this.scan(issuerActor, permission)),
+            );
+            for (const [index, permission] of options.entries()) {
+                const issuerReading = issuerReadings[index];
                 reading.push({
                     $: 'path',
                     via: 'access-token',
@@ -775,6 +786,7 @@ export class PermissionService extends PuterService {
         actor: Actor,
         options: string[],
         reading: ReadingNode[],
+        scanOptions: ScanOptions,
     ): Promise<void> {
         // Direct app only — see `#scanUserAppImplied`.
         if (!actor.app?.id || !actor.user?.id) return;
@@ -782,6 +794,7 @@ export class PermissionService extends PuterService {
             actor.user.id,
             actor.app.id,
             options,
+            { primary: scanOptions.primary === true },
         );
         const row = rows[0];
         if (!row) return;
@@ -1383,20 +1396,17 @@ export class PermissionService extends PuterService {
             );
 
         // As the single revoke: the flat key goes only where no issuer's grant
-        // remains, read from the primary the delete just landed on. A database
-        // that matches case-insensitively may have removed a row spelled other
-        // than asked, and its flat key is under that spelling.
-        const spellings = [...new Set([...rewritten, ...removed])];
+        // remains, read from the primary the delete just landed on.
         const remaining = new Set(
             (
                 await this.stores.permission.readLinkedUserUserPermsFromPrimary(
                     user.id,
-                    spellings,
+                    rewritten,
                 )
             ).map((row) => row.permission),
         );
         await this.stores.permission.delFlatUserPerms(
-            spellings
+            rewritten
                 .filter((permission) => !remaining.has(permission))
                 .map((permission) => ({ holderUserId: user.id, permission })),
         );
@@ -1622,19 +1632,31 @@ export class PermissionService extends PuterService {
             app.id,
             [permission],
         );
+        // A grant without `via` (the user approving it in Puter) replaces a row
+        // a narrower path recorded with one; a narrower one never replaces it.
+        const widens =
+            existing?.extra?.via !== undefined && rowExtra.via === undefined;
         // Skip redundant upserts (saves db roundtrip + cache invalidation),
         // unless the row has yet to record what this grant was asked as.
-        if (existing && (!grantedAs || existing.extra?.grantedAs === grantedAs))
+        if (
+            existing &&
+            !widens &&
+            (!grantedAs || existing.extra?.grantedAs === grantedAs)
+        )
             return;
+        const { via: _via, ...withoutVia } = existing?.extra ?? {};
+        const kept = widens
+            ? withoutVia
+            : grantedAs
+              ? existing?.extra
+              : undefined;
 
         try {
             await this.stores.permission.upsertUserAppPerm(
                 userId,
                 app.id,
                 permission,
-                grantedAs
-                    ? { ...existing?.extra, ...rowExtra, grantedAs }
-                    : rowExtra,
+                { ...kept, ...rowExtra, ...(grantedAs ? { grantedAs } : {}) },
             );
         } catch (error) {
             if (!isMissingParentViolation(error)) throw error;
@@ -1728,11 +1750,12 @@ export class PermissionService extends PuterService {
             this.#announceRevoked(userId, app.uid, removedPermission);
     }
 
+    /** Returns the uid of the app `appIdentifier` resolved to. */
     async revokeUserAppAll(
         actor: Actor,
         appIdentifier: string,
         meta: GrantMeta = {},
-    ): Promise<void> {
+    ): Promise<string> {
         this.#refuseAppActor(actor);
         const app = await this.#requireApp(appIdentifier);
         const userId = this.#requireUserId(actor);
@@ -1755,6 +1778,7 @@ export class PermissionService extends PuterService {
             );
         }
         this.#announceRevoked(userId, app.uid, null);
+        return app.uid;
     }
 
     async grantDevAppPermission(

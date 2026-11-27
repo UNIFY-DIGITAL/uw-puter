@@ -189,20 +189,65 @@ describe('perms request(resource, details)', () => {
         ).rejects.toMatchObject({ code: 'invalid_argument' });
     });
 
+    it('asks to send pushes, alone or behind one prompt with background events', async () => {
+        const mod = makeModule({ requestPermission: () => true });
+
+        expect(await request.call(mod, 'pushNotifications')).toBe(true);
+        expect(mod.puter.ui.requestPermission).toHaveBeenLastCalledWith({
+            permission: 'notifications:push',
+        });
+
+        expect(await request.call(mod, [
+            { resource: 'backgroundEvents' },
+            { resource: 'pushNotifications' },
+        ])).toEqual([true, true]);
+        expect(mod.puter.ui.requestPermission).toHaveBeenCalledTimes(2);
+        expect(mod.puter.ui.requestPermission).toHaveBeenLastCalledWith({
+            permissions: ['events:background', 'notifications:push'],
+        });
+
+        await expect(
+            request.call(mod, 'pushNotifications', { access: 'write' }),
+        ).rejects.toMatchObject({ code: 'invalid_argument' });
+    });
+
+    it('checks pushNotifications against the same permission string, without prompting', async () => {
+        routes({ held: { 'notifications:push': true } });
+        const mod = makeModule();
+
+        expect(await check.call(mod, 'pushNotifications')).toBe(true);
+        expect(mockReq).toHaveBeenLastCalledWith(mod.puter, CHECK_ROUTE, {
+            permissions: ['notifications:push'],
+        });
+        expect(mod.puter.ui.requestPermission).not.toHaveBeenCalled();
+    });
+
     it('asks to share a region of the app\'s own data, named by its prefix', async () => {
         const mod = makeModule({
             requestPermission: () => true,
             whoami: { ...WHOAMI, app_name: SELF_UID },
         });
 
-        expect(await request.call(mod, 'kvShare', { prefix: 'workspace:abc:' })).toBe(true);
+        expect(await request.call(mod, 'kvShare', { prefix: 'workspace:abc:', access: 'write' })).toBe(true);
         expect(mod.puter.ui.requestPermission).toHaveBeenLastCalledWith({
-            permission: `manage:kv-share:u-1:${SELF_UID}:workspace:abc`,
+            permission: `manage:kv-share-write:u-1:${SELF_UID}:workspace:abc`,
         });
 
         await request.call(mod, 'kvShare', { prefix: 'rooms', access: 'watch' });
         expect(mod.puter.ui.requestPermission).toHaveBeenLastCalledWith({
             permission: `manage:kv-share:u-1:${SELF_UID}:rooms`,
+        });
+    });
+
+    it('asks for the level `puter.kv.share()` creates when no access is given', async () => {
+        const mod = makeModule({
+            requestPermission: () => true,
+            whoami: { ...WHOAMI, app_name: SELF_UID },
+        });
+
+        expect(await request.call(mod, 'kvShare', { prefix: 'rooms:abc:' })).toBe(true);
+        expect(mod.puter.ui.requestPermission).toHaveBeenLastCalledWith({
+            permission: `manage:kv-share-read:u-1:${SELF_UID}:rooms:abc`,
         });
     });
 
@@ -389,6 +434,15 @@ describe('perms request(resource, details)', () => {
         expect(await request.call(mod, 'fs:/alice:write')).toBe(true);
         expect(mod.puter.ui.requestPermission).toHaveBeenCalledWith({
             permission: 'fs:/alice:write',
+        });
+    });
+
+    it('asks for push consent as a bare permission string', async () => {
+        const mod = makeModule({ requestPermission: () => true });
+
+        expect(await request.call(mod, 'notifications:push')).toBe(true);
+        expect(mod.puter.ui.requestPermission).toHaveBeenCalledWith({
+            permission: 'notifications:push',
         });
     });
 
@@ -802,7 +856,7 @@ describe('perms check(resource, details)', () => {
             held: {
                 'fs:/alice/notes.txt:write': true,
                 'events:background': false,
-                [`manage:kv-share:u-1:${SELF_UID}:rooms`]: true,
+                [`manage:kv-share-read:u-1:${SELF_UID}:rooms`]: true,
             },
         });
         const mod = makeModule({ whoami: { ...WHOAMI, app_name: SELF_UID } });

@@ -1055,6 +1055,34 @@ describe('AppDriver.create additional branches', () => {
         );
     });
 
+    it('returns the new filetype_associations from a filetype-only update of a cached app', async () => {
+        const { actor } = await makeUser();
+        const created = await withActor(actor, () =>
+            driver.create({
+                object: {
+                    name: uniqueName('ftu'),
+                    title: 't',
+                    index_url: uniqueIndexUrl(),
+                    filetype_associations: ['txt'],
+                },
+            }),
+        );
+        // Let the post-write window lapse so the row is cached again.
+        for (const key of await server.clients.redis.keys('apps:*:deleted')) {
+            await server.clients.redis.del(key);
+        }
+        await server.stores.app.getByUid(created.uid as string);
+        await new Promise((r) => setTimeout(r, 20));
+
+        const updated = await withActor(actor, () =>
+            driver.update({
+                uid: created.uid as string,
+                object: { filetype_associations: ['csv'] },
+            }),
+        );
+        expect(updated.filetype_associations).toEqual(['csv']);
+    });
+
     it('rejects too-long title with 400', async () => {
         const { actor } = await makeUser();
         await expect(
@@ -1884,6 +1912,188 @@ describe('AppDriver alias-group index_url merge', () => {
     });
 });
 
+// ── custom-domain index_url rules ───────────────────────────────────
+//
+// A host a `site.resolveHost` listener maps to a site gets the hosted
+// rules: only the site owner may point an app at it, one app per URL, and
+// creating there absorbs the origin-bootstrap row.
+
+describe('AppDriver custom-domain index_url', () => {
+    const hosts = new Map<string, string>();
+    let failResolve = false;
+    const resolveHost = (
+        _key: unknown,
+        data: { host: string; result: { subdomain: string | null } },
+    ) => {
+        if (failResolve) throw new Error('resolver down');
+        const sub = hosts.get(data.host);
+        if (sub) data.result.subdomain = sub;
+    };
+    const driverConfig = () =>
+        (driver as unknown as { config: Record<string, unknown> }).config;
+
+    beforeAll(() => {
+        driverConfig().custom_domains_enabled = true;
+        server.clients.event.on('site.resolveHost', resolveHost);
+    });
+
+    afterAll(() => {
+        delete driverConfig().custom_domains_enabled;
+        server.clients.event.off('site.resolveHost', resolveHost);
+    });
+
+    const attachDomain = async (userId: number) => {
+        const subdomain = uniqueName('cd');
+        await server.stores.subdomain.create({ userId, subdomain });
+        const host = `${uniqueName('www')}.custom-domain.test`;
+        hosts.set(host, subdomain);
+        return { host, subdomain };
+    };
+
+    it("refuses an index_url on another user's custom domain", async () => {
+        const owner = await makeUser();
+        const other = await makeUser();
+        const { host, subdomain } = await attachDomain(owner.userId);
+
+        const err = await withActor(other.actor, () =>
+            driver.create({
+                object: {
+                    name: uniqueName('cd-squat'),
+                    title: 't',
+                    index_url: `https://${host}/`,
+                },
+            }),
+        ).catch((e: unknown) => e);
+        expect(err).toMatchObject({
+            statusCode: 400,
+            legacyCode: 'subdomain_not_owned',
+        });
+        expect(JSON.stringify(err)).not.toContain(subdomain);
+    });
+
+    it("refuses repointing an app onto another user's custom domain", async () => {
+        const owner = await makeUser();
+        const other = await makeUser();
+        const { host } = await attachDomain(owner.userId);
+        const created = await withActor(other.actor, () =>
+            driver.create({
+                object: {
+                    name: uniqueName('cd-repoint'),
+                    title: 't',
+                    index_url: uniqueIndexUrl(),
+                },
+            }),
+        );
+
+        await expect(
+            withActor(other.actor, () =>
+                driver.update({
+                    uid: created.uid,
+                    object: { index_url: `http://${host}/sub/` },
+                }),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'subdomain_not_owned',
+        });
+    });
+
+    it("absorbs the owner's bootstrap row on create", async () => {
+        const { actor, userId } = await makeUser();
+        const { host } = await attachDomain(userId);
+        // AuthController stamps the site owner on the bootstrap row.
+        const stubUid = `app-${uuidv4()}`;
+        await server.stores.app.createFromOrigin(stubUid, `https://${host}`, {
+            ownerUserId: userId,
+        });
+        const name = uniqueName('cd-create');
+
+        const result = await withActor(actor, () =>
+            driver.create({
+                object: { name, title: 'Mine', index_url: `https://${host}/` },
+            }),
+        );
+
+        expect(result.uid).toBe(stubUid);
+        expect(result.name).toBe(name);
+        expect((await server.stores.app.getByUid(stubUid))?.owner_user_id).toBe(
+            userId,
+        );
+    });
+
+    it('keeps one app per custom-domain URL', async () => {
+        const { actor, userId } = await makeUser();
+        const { host } = await attachDomain(userId);
+        const first = await withActor(actor, () =>
+            driver.create({
+                object: {
+                    name: uniqueName('cd-first'),
+                    title: 't',
+                    index_url: `https://${host}/`,
+                },
+            }),
+        );
+
+        await expect(
+            withActor(actor, () =>
+                driver.create({
+                    object: {
+                        name: uniqueName('cd-second'),
+                        title: 't',
+                        index_url: `http://${host}/index.html`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'app_index_url_already_in_use',
+            fields: { app_uid: first.uid },
+        });
+    });
+
+    it('treats every host as external without a resolver (no prod extension)', async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        const url = uniqueIndexUrl();
+        server.clients.event.off('site.resolveHost', resolveHost);
+        try {
+            for (const { actor } of [a, b]) {
+                await withActor(actor, () =>
+                    driver.create({
+                        object: {
+                            name: uniqueName('cd-none'),
+                            title: 't',
+                            index_url: url,
+                        },
+                    }),
+                );
+            }
+        } finally {
+            server.clients.event.on('site.resolveHost', resolveHost);
+        }
+    });
+
+    it('fails closed when the resolver errors', async () => {
+        const { actor } = await makeUser();
+        failResolve = true;
+        try {
+            await expect(
+                withActor(actor, () =>
+                    driver.create({
+                        object: {
+                            name: uniqueName('cd-down'),
+                            title: 't',
+                            index_url: uniqueIndexUrl(),
+                        },
+                    }),
+                ),
+            ).rejects.toMatchObject({ statusCode: 503 });
+        } finally {
+            failResolve = false;
+        }
+    });
+});
+
 // ── hosted-subdomain ownership check ────────────────────────────────
 //
 // `#ensurePuterSiteSubdomainIsOwned` gates puter-hosted index_urls on a
@@ -2294,7 +2504,10 @@ describe('AppDriver.select query-count regression', () => {
         expect(large.itemCount).toBe(30);
         // Sanity check the classifier actually saw the shapes it's counting.
         expect(small.counts.indexUrlIn).toBeGreaterThan(0);
-        expect(small.counts.subdomains).toBeGreaterThan(0);
+        // Live and dangling backings both come from the warm subdomain cache
+        // (negative entries included), so no subdomains read on either path.
+        expect(small.counts.subdomains).toBe(0);
+        expect(small.pread).toBe(0);
 
         expect(large.counts).toEqual(small.counts);
         expect(large.pread).toBe(small.pread);

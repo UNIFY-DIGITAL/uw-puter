@@ -28,6 +28,7 @@ import {
 import { HttpError } from '../../core/http/HttpError.js';
 import { WEB_AND_EXTENSION_PROTOCOLS } from '../../util/validation.js';
 import { awaitLater } from '../../util/concurrency.js';
+import { appGenerationStart } from '../../util/appGeneration.js';
 import {
     ASSET_WINDOW_SECONDS,
     GODMODE_TOKEN_MAX_AGE_SECONDS,
@@ -39,10 +40,12 @@ import type { UserRow } from '../../stores/user/UserStore';
 import type { LayerInstances } from '../../types';
 import { sessionCookieFlags } from '../../util/cookieFlags.js';
 import { isGodmodeApp } from '../../util/godmodeApps.js';
+import { resolveCustomHostSubdomain } from '../../util/hostedAppBacking.js';
 import { Span } from '../../util/span.js';
 import type { puterServices } from '../index';
 import { EVENTS_WORKER_SESSION_NAME } from '../events/workerRuntime.js';
 import { FULL_API_ACCESS, PERMISSION_MAX_LEN } from '../permission/consts';
+import type { GrantMeta } from '../permission/PermissionService.js';
 import { PuterService } from '../types';
 import type {
     AccessTokenPayload,
@@ -55,9 +58,6 @@ import type {
 const APP_ORIGIN_UUID_NAMESPACE = '33de3768-8ee0-43e9-9e73-db192b97a5d8';
 // Successor uids an origin can derive after its earlier apps were repointed.
 const MAX_ORIGIN_UID_GENERATIONS = 8;
-// Allowed gap between a session's creation time (server clock) and its app's
-// (database clock) before the session counts as older than the app.
-const APP_SESSION_CLOCK_SKEW_SECONDS = 60;
 
 // Revoked and expired sessions are kept this long, so a stale token still gets
 // `session_revoked`/`session_expired` rather than `invalid`, then deleted. Web
@@ -413,6 +413,8 @@ export class AuthService extends PuterService {
             worker?: boolean;
             workerName?: string;
             workerUid?: string;
+            workerSiteUid?: string;
+            workerSite?: string;
         } = {},
     ): string {
         const claims: Record<string, unknown> = {
@@ -429,6 +431,8 @@ export class AuthService extends PuterService {
         if (opts.worker) claims.worker = true;
         if (opts.workerName) claims.worker_name = opts.workerName;
         if (opts.workerUid) claims.worker_uid = opts.workerUid;
+        if (opts.workerSiteUid) claims.workerSiteUid = opts.workerSiteUid;
+        if (opts.workerSite) claims.workerSite = opts.workerSite;
         return this.services.token.sign('auth', claims);
     }
 
@@ -447,7 +451,15 @@ export class AuthService extends PuterService {
         user: UserRow,
         workerName: string,
         meta: Record<string, unknown> = {},
-        { workerUid }: { workerUid?: string } = {},
+        {
+            workerUid,
+            workerSiteUid,
+            workerSite,
+        }: {
+            workerUid?: string;
+            workerSiteUid?: string;
+            workerSite?: string;
+        } = {},
     ): Promise<{
         session: Record<string, unknown>;
         token: string;
@@ -479,14 +491,14 @@ export class AuthService extends PuterService {
             user,
             session.uuid as string,
             auth_id,
-            { worker: true, workerName, workerUid },
+            { worker: true, workerName, workerUid, workerSiteUid, workerSite },
         );
         const gui_token = this.#signSessionTypeToken(
             'gui',
             user,
             session.uuid as string,
             auth_id,
-            { worker: true, workerName, workerUid },
+            { worker: true, workerName, workerUid, workerSiteUid, workerSite },
         );
 
         return { session, token, gui_token };
@@ -515,6 +527,8 @@ export class AuthService extends PuterService {
             handlerDepth?: number;
             expiresInSeconds?: number;
             workerUid?: string;
+            workerSiteUid?: string;
+            workerSite?: string;
         } = {},
     ): Promise<string> {
         if (!actor.user) {
@@ -546,7 +560,7 @@ export class AuthService extends PuterService {
                 appUid,
                 workerName,
                 auth_id,
-                notBefore: this.#appSessionsNotBefore(app),
+                notBefore: appGenerationStart(app),
             },
         );
         if (!session) {
@@ -567,6 +581,12 @@ export class AuthService extends PuterService {
                 worker: true,
                 worker_name: workerName,
                 ...(options.workerUid ? { worker_uid: options.workerUid } : {}),
+                ...(options.workerSiteUid
+                    ? { workerSiteUid: options.workerSiteUid }
+                    : {}),
+                ...(options.workerSite
+                    ? { workerSite: options.workerSite }
+                    : {}),
                 ...(options.handlerDepth
                     ? { handler_depth: options.handlerDepth }
                     : {}),
@@ -932,19 +952,51 @@ export class AuthService extends PuterService {
     }
 
     /**
-     * Delete every session of a worker that no longer exists, whoever minted
-     * it: worker names are unique, so nothing else can be using them.
+     * Delete the owner's sessions for a worker that no longer exists, or, with
+     * `exceptAppUid`, the ones a worker rebound to that app (`null`: to none)
+     * no longer runs on.
      */
-    async deleteWorkerSessionsByName(workerName: string): Promise<void> {
-        if (!workerName) return;
-        await this.#deleteWorkerSessions({ workerName });
+    async deleteWorkerSessionsByName(
+        workerName: string,
+        userId: number,
+        { exceptAppUid }: { exceptAppUid?: string | null } = {},
+    ): Promise<void> {
+        if (!workerName || !userId) return;
+        await this.#deleteWorkerSessions({ workerName, userId, exceptAppUid });
     }
 
     /**
-     * Delete the sessions of the workers an app deployed for this user, e.g.
-     * when the user uninstalls it. The workers themselves keep running.
+     * A user removing an app: every grant they gave it and the sessions of the
+     * workers it deployed for them go, then `app.uninstalled` tells listeners,
+     * which delete the app's data in the account when `deleteData` is set.
      */
-    async deleteWorkerSessionsForApp(
+    async uninstallApp(
+        actor: Actor,
+        appIdentifier: string,
+        {
+            deleteData = false,
+            meta,
+        }: { deleteData?: boolean; meta?: GrantMeta } = {},
+    ): Promise<void> {
+        const appUid = await this.services.permission.revokeUserAppAll(
+            actor,
+            appIdentifier,
+            meta,
+        );
+        const userId = actor.user!.id as number;
+        await this.#deleteWorkerSessionsForApp(userId, appUid);
+        await this.clients.event.emitAndWait(
+            'app.uninstalled',
+            { userId, userUuid: actor.user!.uuid!, appUid, deleteData },
+            {},
+        );
+    }
+
+    /**
+     * Delete the sessions of the workers an app deployed for this user. Their
+     * tokens would otherwise act as the app; the workers keep running.
+     */
+    async #deleteWorkerSessionsForApp(
         userId: number,
         appUid: string,
     ): Promise<void> {
@@ -966,6 +1018,7 @@ export class AuthService extends PuterService {
         workerName?: string;
         userId?: number;
         appUids?: string[];
+        exceptAppUid?: string | null;
     }): Promise<void> {
         const deleted = (await this.stores.session.deleteWorkerSessions(
             filter,
@@ -1312,13 +1365,13 @@ export class AuthService extends PuterService {
      * Resolve the user who owns the hosted subdomain `origin` points at.
      * Returns the `subdomains` row's `user_id` when the origin's host sits
      * under a configured hosting domain (`static_hosting_domain(_alt)` /
-     * `private_app_hosting_domain(_alt)`) and the subdomain is registered; null
-     * for external origins, apex hosting-domain hosts, and unknown subdomains.
-     * Used to stamp the site owner as the creator of origin-bootstrap app
-     * rows.
+     * `private_app_hosting_domain(_alt)`), or is a custom domain serving a
+     * site, and the subdomain is registered; null for external origins, apex
+     * hosting-domain hosts, and unknown subdomains. Used to stamp the site
+     * owner as the creator of origin-bootstrap app rows.
      */
     async subdomainOwnerIdFromOrigin(origin: string): Promise<number | null> {
-        const subdomain = this.#hostedSubdomainForOrigin(origin);
+        const subdomain = await this.#siteSubdomainForOrigin(origin);
         if (!subdomain) return null;
         const row = await this.stores.subdomain.getBySubdomain(subdomain);
         return positiveUserId(row?.user_id);
@@ -1337,7 +1390,9 @@ export class AuthService extends PuterService {
     ): Promise<boolean> {
         const origin = await this.#appOriginFor(indexUrl);
         if (!origin) return false;
-        const siteOwnerId = await this.#siteOwnerIdForOrigin(origin);
+        const siteOwnerId = await this.#siteOwnerIdForSubdomain(
+            await this.#siteSubdomainForOrigin(origin),
+        );
         if (siteOwnerId !== null) return siteOwnerId !== ownerUserId;
 
         const path = new URL(indexUrl).pathname.toLowerCase();
@@ -1350,12 +1405,20 @@ export class AuthService extends PuterService {
         return holderId !== null && holderId !== ownerUserId;
     }
 
-    /**
-     * {@link subdomainOwnerIdFromOrigin}, confirmed against the primary on a
-     * miss so a site registered a moment ago isn't read as unregistered.
-     */
+    /** Owner of the hosted site `origin` is on; custom domains aren't asked. */
     async #siteOwnerIdForOrigin(origin: string): Promise<number | null> {
-        const subdomain = this.#hostedSubdomainForOrigin(origin);
+        return this.#siteOwnerIdForSubdomain(
+            this.#hostedSubdomainForOrigin(origin),
+        );
+    }
+
+    /**
+     * The site's owner, confirmed against the primary on a miss so a site
+     * registered a moment ago isn't read as unregistered.
+     */
+    async #siteOwnerIdForSubdomain(
+        subdomain: string | null,
+    ): Promise<number | null> {
         if (!subdomain) return null;
         const row =
             (await this.stores.subdomain.getBySubdomain(subdomain)) ??
@@ -1363,6 +1426,25 @@ export class AuthService extends PuterService {
                 primary: true,
             }));
         return positiveUserId(row?.user_id);
+    }
+
+    /**
+     * Site `origin` serves: a hosted subdomain, or a custom domain's site.
+     * Custom domains cost a listener round trip, so identity resolution
+     * (`appUidFromOrigin` and its batch) stays on hosted names only.
+     */
+    async #siteSubdomainForOrigin(origin: string): Promise<string | null> {
+        const hosted = this.#hostedSubdomainForOrigin(origin);
+        if (hosted) return hosted;
+        const parsed = URL.parse(origin);
+        if (parsed?.protocol !== 'https:' && parsed?.protocol !== 'http:') {
+            return null;
+        }
+        return resolveCustomHostSubdomain(
+            parsed.hostname,
+            this.config,
+            this.clients.event,
+        );
     }
 
     #hostedSubdomainForOrigin(origin: string): string | null {
@@ -1730,7 +1812,7 @@ export class AuthService extends PuterService {
             appUid,
             {
                 auth_id: this.#authIdFor(actor.user as UserRow),
-                notBefore: this.#appSessionsNotBefore(app),
+                notBefore: appGenerationStart(app),
             },
         );
 
@@ -1788,7 +1870,7 @@ export class AuthService extends PuterService {
                 appUid: app.uid,
                 expiresAt: nowSeconds() + GODMODE_TOKEN_WINDOW_SECONDS,
                 maxAgeSeconds: GODMODE_TOKEN_MAX_AGE_SECONDS,
-                label: app.title || app.name || null,
+                label: app.title || app.name!,
                 auth_id: authId,
             },
         );
@@ -1798,7 +1880,7 @@ export class AuthService extends PuterService {
                 legacyCode: 'internal_error',
             });
         }
-        if (minted.replaced) await this.#retireGodmodeToken(minted.replaced);
+        if (minted?.replaced) await this.#retireGodmodeToken(minted.replaced);
 
         const token = this.services.token.sign('auth', {
             type: 'access-token',
@@ -1877,7 +1959,7 @@ export class AuthService extends PuterService {
         },
     ): Promise<string> {
         const { assetSessionUuid, authId } =
-            await this.#mintAssetSessionContext(claims.sessionUuid);
+            await this.#mintAssetSessionContext(claims.sessionUuid, kind);
         return this.services.token.sign('hosted-asset', {
             kind,
             version: '2',
@@ -1895,26 +1977,12 @@ export class AuthService extends PuterService {
     }
 
     /**
-     * Materialize the `kind='asset'` session row that the cookie's
-     * `session_uuid` claim points at. Parented to the minting session so
-     * revoking it kills the cookie. The cascade is one level deep, so a cookie
-     * minted from a godmode token (itself under a web session) outlives logout
-     * of that web session; accepted, as app tokens outlive it too and the
-     * cookie only serves one app's files after an entitlement check.
-     *
-     * Both fields are `null` only when the caller didn't supply a session at
-     * all — the cookie still mints unparented and without an `auth_id` claim
-     * (matches v1 behavior for access-token-minted cookies that aren't tied to
-     * an interactive session).
-     *
-     * If the caller DID supply a `webSessionUuid` but the lookup misses (row
-     * revoked / expired between mint request and this lookup), throw —
-     * otherwise we'd quietly emit an unparented "ghost" cookie that has no
-     * revocation hook for 7 days. The extra check piggybacks on the lookup we
-     * already had to do, so no added perf cost.
+     * Public cookies reuse the parent; private cookies get a child with an
+     * asset expiry.
      */
     async #mintAssetSessionContext(
         webSessionUuid: string | undefined,
+        kind: HostedAssetKind,
     ): Promise<{ assetSessionUuid: string | null; authId: string | null }> {
         if (!webSessionUuid) return { assetSessionUuid: null, authId: null };
         const webSession = await this.stores.session.getByUuid(webSessionUuid);
@@ -1925,6 +1993,8 @@ export class AuthService extends PuterService {
         }
         const authId =
             ((webSession as SessionRow).auth_id as string | null) ?? null;
+        if (kind === 'public')
+            return { assetSessionUuid: webSessionUuid, authId };
         const row = await this.stores.session.create(
             (webSession as SessionRow).user_id as number,
             {
@@ -2503,6 +2573,8 @@ export class AuthService extends PuterService {
             worker?: boolean;
             worker_name?: string;
             worker_uid?: string;
+            workerSiteUid?: string;
+            workerSite?: string;
         },
         userId: number,
     ): Promise<boolean> {
@@ -2510,6 +2582,18 @@ export class AuthService extends PuterService {
         // Events handler sessions have no worker row; EventsService retires them.
         if (decoded.worker_name === EVENTS_WORKER_SESSION_NAME) return true;
         if (!decoded.worker_name) return false;
+        if (decoded.workerSiteUid) {
+            // Looked up by name to hit the subdomain cache; the uid pins the
+            // row, so a deleted or re-created site fails.
+            const name = decoded.workerSite;
+            if (!name || name.startsWith(WORKER_SUBDOMAIN_PREFIX)) return false;
+            const site = await this.stores.subdomain.getBySubdomain(name);
+            return (
+                !!site &&
+                site.uuid === decoded.workerSiteUid &&
+                Number(site.user_id) === Number(userId)
+            );
+        }
         const row = await this.stores.subdomain.getBySubdomain(
             `${WORKER_SUBDOMAIN_PREFIX}${decoded.worker_name}`,
         );
@@ -2605,14 +2689,17 @@ export class AuthService extends PuterService {
         // uid returns with the next app on that origin. A session older than
         // the app was made for the earlier one. Checked before `touch()` so a
         // rejected token doesn't slide the old session's expiry.
-        const notBefore = this.#appSessionsNotBefore(app);
+        const notBefore = appGenerationStart(app);
         const createdAt = Number(session.created_at);
         if (notBefore !== null && createdAt > 0 && createdAt < notBefore) {
             return { reauth: { reason: 'session_revoked' } };
         }
         if (!(await deployed)) return { invalid: true };
 
-        void this.#touchSession(session.uuid, user.id, ctx);
+        // An events handler's calls are background work, not the user being
+        // active, and its session never expires, so they record no activity.
+        if (decoded.worker_name !== EVENTS_WORKER_SESSION_NAME)
+            void this.#touchSession(session.uuid, user.id, ctx);
 
         const actor = this.#buildAppUnderUserActor(user, app, session);
         this.#applyHandlerDepth(actor, decoded);
@@ -2632,19 +2719,6 @@ export class AuthService extends PuterService {
         const block =
             await this.services.appOriginBlocklist.isOriginBlocked(indexUrl);
         return block.blocked ? { reason: block.reason } : null;
-    }
-
-    /**
-     * Unix seconds before which an app or worker session for `app` belongs to
-     * an earlier app with the same uid; null when the creation time is
-     * unknown.
-     */
-    #appSessionsNotBefore(
-        app: { created_epoch?: unknown } | null | undefined,
-    ): number | null {
-        const created = Number(app?.created_epoch);
-        if (!Number.isFinite(created) || created <= 0) return null;
-        return created - APP_SESSION_CLOCK_SKEW_SECONDS;
     }
 
     #createdBefore(row: SessionRow | null, notBefore: number | null): boolean {
@@ -2722,7 +2796,7 @@ export class AuthService extends PuterService {
             if (blocked) return { blocked };
             // As with app sessions: a token minted under an earlier app that
             // held this uid doesn't authenticate as the current one.
-            const notBefore = this.#appSessionsNotBefore(app);
+            const notBefore = appGenerationStart(app);
             if (
                 this.#createdBefore(session, notBefore) ||
                 this.#createdBefore(parentSession, notBefore)

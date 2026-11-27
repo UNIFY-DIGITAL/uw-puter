@@ -38,10 +38,11 @@ import { PuterStore } from '../types';
 const CACHE_KEY_PREFIX = 'sessions:v2';
 const CACHE_TTL_SECONDS = 15 * 60;
 // Min interval between successive activity flushes per session/user.
-// In-memory throttle keeps DB writes bounded; multi-node duplicates
-// are harmless because the SQL guard `last_activity < ?` makes the
-// UPDATE idempotent.
+// The in-memory throttle is per process; a Redis `SET NX` gate behind it
+// keeps the other nodes from writing the same rows in the same window.
 const TOUCH_THROTTLE_MS = 60 * 1000;
+const TOUCH_GATE_TTL_SECONDS = TOUCH_THROTTLE_MS / 1000;
+const TOUCH_GATE_PREFIX = 'sessions:touch';
 // Hard cap to keep the throttle map from growing unbounded for
 // long-lived processes. Clearing only loses throttling — at worst a
 // brief burst of redundant UPDATEs.
@@ -538,14 +539,24 @@ export class SessionStore extends PuterStore {
      * Returns each deleted row as `{ uuid, userId, accessTokenUid }` so the
      * caller can announce the revocation and drop access-token grants.
      *
+     * `exceptAppUid` keeps the session bound to that app (`null`: the
+     * user-scoped one), for a worker rebound to it.
+     *
      * @param {{
      *     workerName?: string;
      *     userId?: number;
      *     appUid?: string;
      *     appUids?: string[];
+     *     exceptAppUid?: string | null;
      * }} filter
      */
-    async deleteWorkerSessions({ workerName, userId, appUid, appUids } = {}) {
+    async deleteWorkerSessions({
+        workerName,
+        userId,
+        appUid,
+        appUids,
+        exceptAppUid,
+    } = {}) {
         const where = ["`kind` = 'worker'"];
         const params = [];
         if (workerName) {
@@ -567,6 +578,11 @@ export class SessionStore extends PuterStore {
             if (appUids.length === 0) return [];
             where.push(`\`app_uid\` IN (${appUids.map(() => '?').join(', ')})`);
             params.push(...appUids);
+        }
+        if (exceptAppUid === null) where.push('`app_uid` IS NOT NULL');
+        else if (exceptAppUid !== undefined) {
+            where.push('(`app_uid` IS NULL OR `app_uid` <> ?)');
+            params.push(exceptAppUid);
         }
         // No filter would mean every worker session on the server.
         if (params.length === 0) return [];
@@ -657,25 +673,26 @@ export class SessionStore extends PuterStore {
      * comes back as `replaced` for the caller to revoke. Concurrent first
      * launches can each insert a row; both stay valid.
      *
-     * @param userId - User row id (numeric).
-     * @param opts.parentSessionUid - The web session minting it; revoking that
-     *   session cascades here.
-     * @param opts.appUid - The godmode app.
-     * @param opts.expiresAt - Unix seconds the row lives to unless renewed.
-     * @param opts.maxAgeSeconds - Oldest a row may be and still be renewed.
-     * @param opts.label - Shown in the sessions list.
-     * @param opts.auth_id - Stable per-user identity.
+     * @param {number} userId - User row id.
+     * @param {{
+     *     parentSessionUid: string;
+     *     appUid: string;
+     *     expiresAt: number;
+     *     maxAgeSeconds: number;
+     *     label?: string;
+     *     auth_id?: string;
+     * }} opts
+     *   - `parentSessionUid` is the web session minting it; revoking that session
+     *       cascades here. `appUid` is the godmode app. `expiresAt` is the unix
+     *       seconds the row lives to unless renewed. `maxAgeSeconds` is the
+     *       oldest a row may be and still be renewed. `label` is shown in the
+     *       sessions list. `auth_id` is the stable per-user identity.
+     *
+     * @returns
      */
     async getOrCreateGodmodeToken(
         userId,
-        {
-            parentSessionUid,
-            appUid,
-            expiresAt,
-            maxAgeSeconds,
-            label = null,
-            auth_id = null,
-        },
+        { parentSessionUid, appUid, expiresAt, maxAgeSeconds, label, auth_id },
     ) {
         if (!userId || !parentSessionUid || !appUid) return null;
 
@@ -1085,23 +1102,59 @@ export class SessionStore extends PuterStore {
             this.#lastUserTouchMs.set(userId, nowMs);
         }
 
+        const [sessionClaimed, userClaimed] = await Promise.all([
+            sessionDue &&
+                this.#claimTouchGate(`${TOUCH_GATE_PREFIX}:s:${uuid}`),
+            userDue && this.#claimTouchGate(`${TOUCH_GATE_PREFIX}:u:${userId}`),
+        ]);
+
         const tasks = [];
-        if (sessionDue) {
+        if (sessionClaimed) {
             tasks.push(
-                this.updateActivity(uuid, Math.floor(nowMs / 1000), {
-                    ip,
-                    userAgent,
-                }).catch(() => {}),
+                (async () => {
+                    try {
+                        await this.updateActivity(
+                            uuid,
+                            Math.floor(nowMs / 1000),
+                            { ip, userAgent },
+                        );
+                    } catch {
+                        // best-effort
+                    }
+                })(),
             );
         }
-        if (userDue) {
+        if (userClaimed) {
             tasks.push(
-                this.updateUserActivity(userId, sqlTimestamp(nowMs)).catch(
-                    () => {},
-                ),
+                (async () => {
+                    try {
+                        await this.updateUserActivity(
+                            userId,
+                            sqlTimestamp(nowMs),
+                        );
+                    } catch {
+                        // best-effort
+                    }
+                })(),
             );
         }
         await Promise.all(tasks);
+    }
+
+    /** True when this node won the touch window; fails open on Redis errors. */
+    async #claimTouchGate(key) {
+        try {
+            const result = await this.clients.redis.set(
+                key,
+                '1',
+                'EX',
+                TOUCH_GATE_TTL_SECONDS,
+                'NX',
+            );
+            return result === 'OK';
+        } catch {
+            return true;
+        }
     }
 
     // -- Internals ---------------------------------------------------

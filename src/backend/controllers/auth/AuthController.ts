@@ -3306,6 +3306,14 @@ export class AuthController extends PuterController {
                 { legacyCode: 'bad_request' },
             );
         }
+        // Only unsharing retires the handle along with its grant; withdrawing
+        // the grant alone would leave the share listed and dead.
+        if (typeof permission === 'string' && isKvSharePermission(permission))
+            throw new HttpError(
+                400,
+                'Stop a key-value share with `puter.kv.unshare()` (`DELETE /kv/shares/:handle`)',
+                { legacyCode: 'bad_request' },
+            );
         await this.services.permission.revokeUserUserPermission(
             req.actor!,
             target_username,
@@ -3329,7 +3337,8 @@ export class AuthController extends PuterController {
     })
     async handleRevokeUserApp(req: Request, res: Response): Promise<void> {
         let { app_uid } = req.body ?? {};
-        const { origin, permission, permissions, meta } = req.body ?? {};
+        const { origin, permission, permissions, meta, deleteData } =
+            req.body ?? {};
         this.#validateAppPermissionParams({
             app_uid,
             origin,
@@ -3345,20 +3354,25 @@ export class AuthController extends PuterController {
                 legacyCode: 'bad_request',
             });
         }
+        if (deleteData !== undefined && typeof deleteData !== 'boolean') {
+            throw new HttpError(400, '`deleteData` must be a boolean', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (deleteData && permission !== '*') {
+            throw new HttpError(
+                400,
+                '`deleteData` only applies when `permission` is "*"',
+                { legacyCode: 'bad_request' },
+            );
+        }
         // Deliberately not gated by the target's sharing flag: a user must
         // always be able to withdraw a grant, whatever the target now says.
         if (permission === '*') {
-            await this.services.permission.revokeUserAppAll(
-                req.actor!,
-                app_uid,
-                meta ?? undefined,
-            );
-            // Withdrawing everything also retires the workers the app deployed
-            // under this user; their tokens would otherwise act as the app.
-            await this.services.auth.deleteWorkerSessionsForApp(
-                req.actor!.user!.id as number,
-                app_uid,
-            );
+            await this.services.auth.uninstallApp(req.actor!, app_uid, {
+                deleteData: deleteData === true,
+                meta: meta ?? undefined,
+            });
         } else {
             for (const entry of list) {
                 await this.services.permission.revokeUserAppPermission(
@@ -3806,8 +3820,9 @@ export class AuthController extends PuterController {
 
         let app = await this.stores.app.getByUid(app_uid);
         if (!app && resolvedFromOrigin) {
-            // Hosted-subdomain origins get the site owner stamped as the
-            // app's creator at bootstrap; external origins stay unowned.
+            // Hosted-subdomain and custom-domain origins get the site owner
+            // stamped as the app's creator at bootstrap; external origins
+            // stay unowned.
             // Canonical origin only, so alternate hosts share one row.
             const canonicalOrigin =
                 this.services.auth.canonicalizeOrigin(origin);
@@ -3823,9 +3838,10 @@ export class AuthController extends PuterController {
             // An origin's uid is a deterministic uuidv5, so a deleted app
             // reappears here under the identical uid. Withdraw any cross-app
             // data grants left pointing at it before this new row can inherit
-            // consent the user gave its predecessor. Only *this* path can reuse
-            // a uid: `AppStore.create` mints a random uuid4, which no deleted
-            // app can ever hold again.
+            // consent the user gave its predecessor. Only `createFromOrigin`
+            // reuses a uid, here or wherever else an origin app is bootstrapped:
+            // `AppStore.create` mints a random uuid4, which no deleted app can
+            // ever hold again.
             //
             // Called directly rather than through `app.changed`: the token is
             // issued below, so this has to be able to stop that, and
@@ -3836,6 +3852,9 @@ export class AuthController extends PuterController {
                 app_uid,
                 'uid reused by a new app',
             );
+            // Key-value shares the predecessor left read as gone already,
+            // being older than this row; this only cleans them up.
+            this.services.kvShare.retireSharesOlderThanApp(app);
         }
         if (!app) {
             throw new HttpError(404, `App ${app_uid} does not exist`, {
@@ -4271,7 +4290,27 @@ export class AuthController extends PuterController {
             );
         }
 
-        this.#requireAccountTwoFactor(user, req.body?.code);
+        const code = req.body?.code;
+        if (
+            user.otp_enabled &&
+            typeof code === 'string' &&
+            /^[A-Z0-9]{8}$/.test(code)
+        ) {
+            await this.#assertSecondFactorAttemptsRemain(user.uuid);
+            const consumed = await this.stores.user.consumeOtpRecoveryCode(
+                user.id,
+                hashRecoveryCode(code),
+            );
+            if (!consumed) {
+                await this.#recordSecondFactorFailure(user.uuid);
+                throw new HttpError(401, 'Incorrect code.', {
+                    legacyCode: 'code_mismatch',
+                    fields: { factor: 'otp' },
+                });
+            }
+        } else {
+            this.#requireAccountTwoFactor(user, code);
+        }
 
         await this.stores.user.update(user.id, {
             otp_enabled: false,
@@ -4481,11 +4520,14 @@ export class AuthController extends PuterController {
         }
 
         const token = signStepUpToken(this.services.token, user as never);
-        res.cookie(
-            STEP_UP_COOKIE_NAME,
-            token,
-            stepUpCookieOptions(this.config),
-        );
+        const isApiHost = req.subdomains?.at(-1) === 'api';
+        if (!isApiHost) {
+            res.cookie(
+                STEP_UP_COOKIE_NAME,
+                token,
+                stepUpCookieOptions(this.config),
+            );
+        }
 
         // A browser reads its elevation back from the httpOnly cookie and never
         // needs the raw value; handing it to page JS would put the second factor
@@ -4494,7 +4536,9 @@ export class AuthController extends PuterController {
         // password/TOTP — this only avoids needless exposure, it isn't a gate.
         const cookieName = this.config.cookie_name ?? 'puter_token';
         const usedSessionCookie =
-            !!req.token && req.token === req.cookies?.[cookieName];
+            !isApiHost &&
+            !!req.token &&
+            req.token === req.cookies?.[cookieName];
         res.json(
             usedSessionCookie ? { elevated: true } : { elevated: true, token },
         );
@@ -4607,13 +4651,19 @@ export class AuthController extends PuterController {
         await checkRateLimit(`${scope}:${userUid}`, limit, window);
     }
 
-    /** An `otp-login` JWT completes one sign-in; a second redemption is refused. */
+    /**
+     * An `otp-login` JWT completes one sign-in; a second redemption is refused.
+     * Fails closed: while the store can't say whether the token was used, the
+     * sign-in is refused rather than letting a captured token replay.
+     */
     async #consumeOtpLoginToken(token: string): Promise<void> {
         const digest = crypto.createHash('sha256').update(token).digest('hex');
         const firstUse = await checkRateLimit(
             `login-otp-token-used:${digest}`,
             1,
             OTP_LOGIN_TOKEN_USED_WINDOW_MS,
+            undefined,
+            { failOpen: false },
         );
         if (!firstUse) {
             throw new HttpError(400, 'Invalid token.', {

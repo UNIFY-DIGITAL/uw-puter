@@ -18,8 +18,9 @@
  */
 
 /**
- * Durable subscriptions end to end: the routes that create and revoke them, who
- * each credential shape may see, and what a write costs once one exists.
+ * Durable subscriptions end to end: the routes that create, update and revoke
+ * them, who each credential shape may see, and what a write costs once one
+ * exists.
  *
  * The cost assertions are the point of the whole cache. A subscription made
  * here is deliverable here without the table, and a region that has never seen
@@ -36,6 +37,7 @@ import {
 } from '../../controllers/events/limits.js';
 import { DEFAULT_FREE_SUBSCRIPTION } from '../metering/consts.js';
 import { makeActor } from '../../core/actor.js';
+import { DURABLE_CONTEXT_MAX_BYTES } from '../../stores/events/DurableSubscriptionStore.js';
 import { setupPuterTestEnv, type PuterTestEnv } from '../../testUtil.js';
 import type { IConfig } from '../../types.js';
 import { appSocketRoom } from '../socket/SocketService.js';
@@ -97,12 +99,19 @@ const listSubscriptions = (token: string, query = ''): Promise<ApiResponse> =>
 const unsubscribe = (token: string, subId: string): Promise<ApiResponse> =>
     call('POST', '/events/unsubscribe', token, { subId });
 
+const updateContext = (
+    token: string,
+    subId: string,
+    body: object,
+): Promise<ApiResponse> =>
+    call('POST', '/events/subscriptions/update', token, { subId, ...body });
+
 const subIdsOf = (response: ApiResponse): string[] =>
     (response.body.items as Array<{ subId: string }>).map((row) => row.subId);
 
 /**
  * An app the user has granted `list` on the shared anchor, and consent to run
- * its handler in the background — which durable rows target by default.
+ * its handler in the background.
  */
 const makeApp = async (
     options: { background?: boolean } = {},
@@ -250,127 +259,104 @@ describe('creating a durable subscription over HTTP', () => {
         expect(created.status).toBe(200);
         expect(created.body).toMatchObject({
             subject: `fs:${anchor}`,
-            delivery: 'broadcast',
-            // No app, so no events worker to target — see the null-app
-            // suite below.
-            targets: ['socket'],
+            queue: false,
             appUid: null,
         });
         expect(created.body.context).toBeUndefined();
+        expect(created.body.targets).toBeUndefined();
+        expect(created.body.delivery).toBeUndefined();
+        expect(created.body.single).toBeUndefined();
     });
 
     it('registers a subscription owed to one consumer', async () => {
         await clearRows();
         const created = await subscribe(env.users.user.token, {
-            delivery: 'single',
+            queue: true,
             handlerName: 'onWrite',
         });
 
         expect(created.status).toBe(200);
         expect(created.body).toMatchObject({
+            queue: true,
+            handlerName: 'onWrite',
+        });
+    });
+
+    it('still reads the older `delivery` option', async () => {
+        await clearRows();
+        const queued = await subscribe(env.users.user.token, {
             delivery: 'single',
             handlerName: 'onWrite',
-            targets: ['socket'],
         });
+        const broadcast = await subscribe(env.users.user.token, {
+            delivery: 'broadcast',
+        });
+
+        expect(queued.body.queue).toBe(true);
+        expect(broadcast.body.queue).toBe(false);
+    });
+
+    it('accepts and ignores `targets`', async () => {
+        await clearRows();
+        const created = await subscribe(env.users.user.token, {
+            queue: true,
+            handlerName: 'onWrite',
+            targets: ['push', 'carrier-pigeon'],
+        });
+
+        expect(created.status).toBe(200);
+        expect(created.body.queue).toBe(true);
+    });
+
+    it('refuses `queue` and `delivery` that disagree, or a `queue` that is not a boolean', async () => {
+        for (const body of [
+            { queue: false, delivery: 'single' },
+            { queue: 'yes' },
+            { delivery: 'fanout' },
+        ]) {
+            const refused = await subscribe(env.users.user.token, body);
+            expect(refused.status).toBe(400);
+            expect(refused.body.code).toBe('bad_request');
+        }
     });
 
     it('refuses one owed to a consumer it cannot name', async () => {
-        const refused = await subscribe(env.users.user.token, {
-            delivery: 'single',
-        });
-
-        expect(refused.status).toBe(400);
-        expect(refused.body.code).toBe('events_handler_required');
-    });
-
-    it('refuses one owed to a device notification', async () => {
-        const refused = await subscribe(env.users.user.token, {
-            delivery: 'single',
-            handlerName: 'onWrite',
-            targets: ['push'],
-        });
-
-        expect(refused.status).toBe(400);
-        expect(refused.body.code).toBe('invalid_targets');
-    });
-
-    it('refuses a `worker` target from an account session naming no app', async () => {
-        // Exactly one events worker per app: an account session has none, so
-        // asking for the worker target explicitly is refused rather than
-        // silently dropped — silently dropping it would leave the caller
-        // thinking background delivery was configured when it never could be.
-        const refused = await subscribe(env.users.user.token, {
-            delivery: 'single',
-            handlerName: 'onWrite',
-            targets: ['socket', 'worker'],
-        });
-
-        expect(refused.status).toBe(400);
-        expect(refused.body.code).toBe('invalid_targets');
+        for (const body of [{ queue: true }, { delivery: 'single' }]) {
+            const refused = await subscribe(env.users.user.token, body);
+            expect(refused.status).toBe(400);
+            expect(refused.body.code).toBe('events_handler_required');
+        }
     });
 
     it('refuses background delivery an app has no consent for', async () => {
         // An app of its own, so nothing it holds includes the consent.
         const { token } = await makeApp({ background: false });
 
-        const refused = await call('POST', '/events/subscribe', token, {
-            subject: `fs:${anchor}`,
-            delivery: 'single',
-            handlerName: 'onWrite',
-            targets: ['worker'],
-        });
+        for (const queue of [true, false]) {
+            const refused = await call('POST', '/events/subscribe', token, {
+                subject: `fs:${anchor}`,
+                queue,
+                handlerName: 'onWrite',
+            });
 
-        expect(refused.status).toBe(403);
-        expect(refused.body.code).toBe('events_background_consent_required');
-        // Refused before the handler is even looked up: consent comes first.
-        expect(refused.body.message).toContain('events:background');
+            expect(refused.status).toBe(403);
+            expect(refused.body.code).toBe(
+                'events_background_consent_required',
+            );
+            // Refused before the handler is even looked up: consent comes first.
+            expect(refused.body.message).toContain('events:background');
+        }
     });
 
-    it('requires consent for the default targets an app row gets, even with none named', async () => {
-        // An app of its own, so nothing it holds includes the consent.
-        const { token } = await makeApp({ background: false });
-
-        // No `targets` at all: an app row defaults to `['socket', 'worker']`,
-        // and that default still needs the consent — the gate runs on the
-        // resolved targets, not only on an explicit ask for `worker`.
-        const refused = await call('POST', '/events/subscribe', token, {
-            subject: `fs:${anchor}`,
-        });
-
-        expect(refused.status).toBe(403);
-        expect(refused.body.code).toBe('events_background_consent_required');
-    });
-
-    it('needs no consent for a subscription only a connection hears', async () => {
+    it('needs no consent for an app subscription with no handler to run', async () => {
         const { token } = await makeApp({ background: false });
 
         const created = await call('POST', '/events/subscribe', token, {
             subject: `fs:${anchor}`,
-            targets: ['socket'],
         });
 
         expect(created.status).toBe(200);
-        expect(created.body.targets).toEqual(['socket']);
-    });
-
-    it('refuses a target outside the known set', async () => {
-        const refused = await subscribe(env.users.user.token, {
-            targets: ['socket', 'carrier-pigeon'],
-        });
-
-        expect(refused.status).toBe(400);
-        expect(refused.body.code).toBe('invalid_targets');
-    });
-
-    it('refuses an app`s `single` subscription with no worker to fall back to', async () => {
-        const refused = await subscribe(appOneToken, {
-            delivery: 'single',
-            handlerName: 'onWrite',
-            targets: ['socket'],
-        });
-
-        expect(refused.status).toBe(400);
-        expect(refused.body.code).toBe('invalid_targets');
+        expect(created.body.handlerName).toBeNull();
     });
 
     it('refuses a scoped token with no app, even on a subject it can read', async () => {
@@ -380,11 +366,7 @@ describe('creating a durable subscription over HTTP', () => {
     });
 
     it('refuses a scoped token an app issued, even into that app', async () => {
-        // Socket-only, so the background consent the token lacks is not
-        // what refuses it.
-        const refused = await subscribe(appOneAccessToken, {
-            targets: ['socket'],
-        });
+        const refused = await subscribe(appOneAccessToken);
         expect(refused.status).toBe(403);
         expect(refused.body.code).toBe('events_durable_requires_account');
     });
@@ -615,6 +597,140 @@ describe('what each credential sees and removes', () => {
     });
 });
 
+describe('replacing a durable subscription`s context', () => {
+    const resetBudget = () =>
+        env.server.clients.redis.del(
+            `rate:${EVENTS_SUBSCRIBE_LIMIT.scope}:${userId}`,
+        );
+
+    /** The row this region would deliver against, read from its cache. */
+    const cachedRow = async (subId: string) => {
+        const stored =
+            await env.server.stores.durableSubscription.getBySubId(subId);
+        const cached = await env.server.stores.eventSubscription.getForTokens(
+            userId,
+            [stored!.token],
+        );
+        return cached.find((row) => row.subId === subId);
+    };
+
+    it('keeps the id and the backlog, and delivers the new value from then on', async () => {
+        await resetBudget();
+        await clearRows();
+        const created = await subscribe(appOneToken, {
+            context: { label: 'old' },
+        });
+        const subId = created.body.subId as string;
+        await env.server.stores.pendingDelivery.enqueue(subId, {
+            id: uuidv4(),
+            subject: `fs:${anchor}`,
+            op: 'gap',
+            reason: 'backlog_overflow',
+            ts: Date.now(),
+        });
+
+        const updated = await updateContext(appOneToken, subId, {
+            context: { label: 'new', region: 'eu' },
+        });
+
+        expect(updated.status).toBe(200);
+        expect(updated.body).toMatchObject({
+            subId,
+            contextKeys: ['label', 'region'],
+        });
+        expect(updated.body.contextHash).not.toBe(created.body.contextHash);
+        expect(subIdsOf(await listSubscriptions(appOneToken))).toEqual([
+            subId,
+        ]);
+        await expect(
+            env.server.stores.pendingDelivery.depth(subId),
+        ).resolves.toBe(1);
+        expect((await cachedRow(subId))?.context).toBe(
+            JSON.stringify({ label: 'new', region: 'eu' }),
+        );
+    });
+
+    it('clears it with null', async () => {
+        await resetBudget();
+        await clearRows();
+        const subId = (
+            await subscribe(env.users.user.token, { context: { a: 1 } })
+        ).body.subId as string;
+
+        const cleared = await updateContext(env.users.user.token, subId, {
+            context: null,
+        });
+
+        expect(cleared.status).toBe(200);
+        expect(cleared.body).toMatchObject({
+            contextKeys: null,
+            contextHash: null,
+        });
+        expect((await cachedRow(subId))?.context).toBeNull();
+    });
+
+    it('refuses a body without context, and a context over the cap', async () => {
+        await resetBudget();
+        await clearRows();
+        const subId = (
+            await subscribe(env.users.user.token, { context: { a: 1 } })
+        ).body.subId as string;
+
+        const missing = await updateContext(env.users.user.token, subId, {});
+        expect(missing.status).toBe(400);
+        expect(missing.body.code).toBe('bad_request');
+
+        const tooLarge = await updateContext(env.users.user.token, subId, {
+            context: { blob: 'x'.repeat(DURABLE_CONTEXT_MAX_BYTES) },
+        });
+        expect(tooLarge.status).toBe(413);
+        expect(tooLarge.body.code).toBe('events_context_too_large');
+        expect((await cachedRow(subId))?.context).toBe(
+            JSON.stringify({ a: 1 }),
+        );
+    });
+
+    it('answers a row the caller does not hold as absent', async () => {
+        await resetBudget();
+        await clearRows();
+        const mine = (await subscribe(appOneToken)).body.subId as string;
+
+        for (const token of [appTwoToken, appOneAccessToken, readUrlToken]) {
+            const refused = await updateContext(token, mine, {
+                context: { stolen: true },
+            });
+            expect(refused.status).toBe(404);
+            expect(refused.body.code).toBe('subscription_does_not_exist');
+        }
+        expect((await cachedRow(mine))?.context).toBeNull();
+    });
+
+    it('spends the subscribe budget', async () => {
+        await resetBudget();
+        try {
+            await clearRows();
+            const mine = (await subscribe(env.users.user.token)).body
+                .subId as string;
+            for (let i = 1; i < EVENTS_SUBSCRIBE_LIMIT.limit; i++)
+                await updateContext(env.users.user.token, mine, {
+                    context: { i },
+                });
+
+            const refused = await subscribe(env.users.user.token);
+            expect(refused.status).toBe(429);
+            const refusedUpdate = await updateContext(
+                env.users.user.token,
+                mine,
+                { context: { i: -1 } },
+            );
+            expect(refusedUpdate.status).toBe(429);
+            expect(refusedUpdate.body.code).toBe('too_many_requests');
+        } finally {
+            await resetBudget();
+        }
+    });
+});
+
 describe('what a write costs once a durable row exists', () => {
     it('delivers straight after subscribe without reading the table', async () => {
         await clearRows();
@@ -795,9 +911,9 @@ describe('where a durable delivery is addressed', () => {
         send.mockRestore();
     });
 
-    it('sends an unmarked copy for an app row that only targets the socket', async () => {
+    it('sends an unmarked copy for an app row', async () => {
         await clearRows();
-        await subscribe(appOneToken, { targets: ['socket'] });
+        await subscribe(appOneToken);
         const send = vi.spyOn(env.server.services.socket, 'send');
         delivered.length = 0;
 
@@ -931,6 +1047,10 @@ describe('with events switched off', () => {
             }),
             offCall('GET', '/events/subscriptions'),
             offCall('POST', '/events/unsubscribe', { subId: 'user#nope' }),
+            offCall('POST', '/events/subscriptions/update', {
+                subId: 'user#nope',
+                context: null,
+            }),
         ]) {
             const response = await attempt;
             expect(response.status).toBe(503);
@@ -1014,13 +1134,6 @@ describe('what a plan lets an account hold', () => {
             actor.actor!,
             uid,
             `fs:${entry!.uid}:list`,
-        );
-        // A durable app row targets the worker by default, so the caps are only
-        // reachable once the background consent behind that target is given.
-        await tiered.server.services.permission.grantUserAppPermission(
-            actor.actor!,
-            uid,
-            EVENTS_BACKGROUND_PERMISSION,
         );
         tieredApp = {
             uid,

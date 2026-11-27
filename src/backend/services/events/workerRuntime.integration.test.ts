@@ -133,11 +133,13 @@ const INGEST_SOURCE = `async ({ event, ctx, user, fetch, ack }) => {
             kv,
             outsideStat,
             token: user.authToken,
+            // Read off globalThis, where the router runtime and the deploy's
+            // bindings put them: a bare name is refused at publish.
             ambient: {
-                me: typeof me,
-                router: typeof router,
-                puterAuth: typeof puter_auth,
-                invokeKey: typeof events_invoke_key,
+                me: typeof globalThis.me,
+                router: typeof globalThis.router,
+                puterAuth: typeof globalThis.puter_auth,
+                invokeKey: typeof globalThis.events_invoke_key,
             },
         }),
     });
@@ -282,28 +284,6 @@ const rehydrate = async (
 };
 
 const subscribe = async (
-    handlerName: string,
-    context?: object,
-): Promise<string> => {
-    const response = await api('POST', '/events/subscribe', {
-        subject: `fs:${anchor}`,
-        delivery: 'single',
-        handlerName,
-        targets: ['worker'],
-        ...(context ? { context } : {}),
-    });
-    expect(response.status).toBe(200);
-    return String(response.body.subId);
-};
-
-/**
- * Like `subscribe`, but with no `targets` override — the default
- * (`['socket', 'worker']`) rather than the `['worker']` the rest of this suite
- * pins. Only this leaves `socket` in play, which is what a background
- * delivery's own client (wrongly) showing up in the app's delivery room would
- * actually steer onto.
- */
-const subscribeWithSocketTarget = async (
     handlerName: string,
     context?: object,
 ): Promise<string> => {
@@ -676,10 +656,7 @@ describe('the client a handler runs as', () => {
         { timeout: TEST_TIMEOUT_MS },
         async () => {
             const room = appSocketRoom(userId, appUid);
-            // `subscribeWithSocketTarget` leaves `socket` a live option for
-            // this delivery — the ordinary `subscribe()` helper pins
-            // `targets: ['worker']` specifically to avoid exercising this.
-            await subscribeWithSocketTarget('ingest', { sink: sinkUrl });
+            await subscribe('ingest', { sink: sinkUrl });
 
             await touch('first.txt');
             await delivered(1);

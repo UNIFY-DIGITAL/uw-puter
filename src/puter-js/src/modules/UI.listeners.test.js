@@ -134,6 +134,35 @@ describe('AppConnection', () => {
 });
 
 describe('host replies (env: app)', () => {
+    it('rejects launchApp when the desktop replies with a handler error', async () => {
+        const ui = makeUI();
+        const result = ui.launchApp('missing-app');
+        const rejection = expect(result).rejects.toMatchObject({
+            code: 'ipc_handler_failed',
+        });
+        await vi.waitFor(() => expect(parentPostMessage).toHaveBeenCalled());
+        const { uuid } = parentPostMessage.mock.calls.at(-1)[0];
+        await deliver({
+            source: parentWindow,
+            origin: 'https://puter.com',
+            data: {
+                $SCOPE,
+                id: uuid,
+                args: [
+                    {
+                        $: 'puter-ipc-error',
+                        error: {
+                            code: 'ipc_handler_failed',
+                            message: 'The request could not be completed.',
+                        },
+                    },
+                ],
+            },
+        });
+        await rejection;
+        expect(ui.util.rpc.callbackManager.callbacks.size).toBe(0);
+    });
+
     it('frees an IPC reply callback once the reply arrives', async () => {
         const ui = makeUI();
         const { callbackManager } = ui.util.rpc;
@@ -192,6 +221,70 @@ describe('host replies (env: app)', () => {
         });
 
         expect(onLocale).toHaveBeenCalledWith({ language: 'fr' });
+    });
+
+    it('emits a notificationClick broadcast from the desktop', async () => {
+        const ui = makeUI();
+        const onClick = vi.fn();
+        ui.on('notificationClick', onClick);
+
+        await deliver({
+            source: parentWindow,
+            origin: 'https://puter.com',
+            data: {
+                msg: 'broadcast',
+                name: 'notificationClick',
+                data: { uid: 'n-1', target: '/a', data: { id: 1 } },
+            },
+        });
+
+        expect(onClick).toHaveBeenCalledWith({ uid: 'n-1', target: '/a', data: { id: 1 } });
+    });
+
+    it('hands a click broadcast to the first notifications click handler once', async () => {
+        const { NotificationsModule } = await import('./notifications/index.js');
+        const ui = makeUI();
+        const notifications = new NotificationsModule({ ...makePuter(), ui });
+        const click = {
+            msg: 'broadcast',
+            name: 'notificationClick',
+            data: { uid: 'n-1', target: '/a', data: null },
+        };
+        await deliver({ source: parentWindow, origin: 'https://puter.com', data: click });
+
+        const first = vi.fn();
+        const second = vi.fn();
+        notifications.on('click', first);
+        notifications.on('click', second);
+        await deliver({
+            source: parentWindow,
+            origin: 'https://puter.com',
+            data: { ...click, data: { uid: 'n-2' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect(first.mock.calls).toEqual([
+            [{ uid: 'n-1', target: '/a', data: null }],
+            [{ uid: 'n-2', target: null, data: null }],
+        ]);
+        expect(second.mock.calls).toEqual([[{ uid: 'n-2', target: null, data: null }]]);
+    });
+
+    it('drops a notificationClick broadcast from another source', async () => {
+        const { NotificationsModule } = await import('./notifications/index.js');
+        const ui = makeUI();
+        const notifications = new NotificationsModule({ ...makePuter(), ui });
+        const onClick = vi.fn();
+        notifications.on('click', onClick);
+
+        await deliver({
+            source: {},
+            origin: 'https://example.com',
+            data: { msg: 'broadcast', name: 'notificationClick', data: { uid: 'n-1' } },
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(onClick).not.toHaveBeenCalled();
     });
 
     it('reports an error reply instead of rejecting the listener', async () => {

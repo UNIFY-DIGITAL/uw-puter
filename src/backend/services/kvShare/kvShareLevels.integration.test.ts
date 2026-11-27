@@ -26,6 +26,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import {
     afterAll,
+    afterEach,
     beforeAll,
     beforeEach,
     describe,
@@ -36,6 +37,7 @@ import {
 import {
     EVENTS_COALESCE_WINDOW_MS,
     EVENTS_KV_HANDLE_LIMIT,
+    EVENTS_SUBSCRIBE_LIMIT,
 } from '../../controllers/events/limits.js';
 import { makeActor, type Actor } from '../../core/actor.js';
 import { runWithContext } from '../../core/context.js';
@@ -185,6 +187,14 @@ const makeApp = async () => {
     );
     return app;
 };
+
+/** What launching the app records: the user authorizing it. */
+const authorizeApp = (user: TestUser, app: { uid: string }) =>
+    permissions().grantUserAppPermission(
+        user.actor,
+        app.uid,
+        'flag:app-is-authenticated',
+    );
 
 const appActorFor = (user: TestUser, app: { uid: string; id: number }) =>
     makeActor({
@@ -399,6 +409,106 @@ describe('changing a share`s level', () => {
 
         expect(await holds(guest, `${prefix}w:`, 'write')).toBe(false);
         expect(await holds(guest, `${prefix}w:k`, 'read')).toBe(true);
+    });
+});
+
+describe('values through a share handle', () => {
+    beforeEach(async () => {
+        for (const user of [owner, guest])
+            await env.server.clients.redis.del(
+                `rate:${EVENTS_SUBSCRIBE_LIMIT.scope}:${user.id}`,
+            );
+    });
+
+    afterEach(async () => {
+        for (const user of [owner, guest])
+            await events().reapSocket(user.id, SOCKET_ID);
+    });
+
+    /** A session subscription on the handle that asks for values. */
+    const watchValues = async (handle: string, user = guest) =>
+        (
+            await events().subscribe(user.actor, SOCKET_ID, {
+                subject: `kv:${handle}:*`,
+                includeValue: true,
+            })
+        ).sub;
+
+    /** The event one write delivers to `subId`. */
+    const deliveredAfter = async (subId: string, write: () => unknown) => {
+        delivered.length = 0;
+        await write();
+        let found: DeliveryEnvelope | undefined;
+        await vi.waitFor(
+            () => {
+                found = delivered.find((one) => one.subId === subId);
+                expect(found).toBeDefined();
+            },
+            { timeout: EVENTS_COALESCE_WINDOW_MS * 12, interval: 25 },
+        );
+        return found!.event as Record<string, unknown>;
+    };
+
+    it('leaves the value out at watch, even when the subscription asked for it', async () => {
+        const prefix = region('values-watch');
+        const { handle } = await share(prefix, 'watch');
+        const sub = await watchValues(handle);
+        expect(sub.includeValue).toBe(true);
+
+        const event = await deliveredAfter(sub.subId, () =>
+            ownerWrites(`${prefix}note`, 'hidden'),
+        );
+        expect(event).toMatchObject({ key: 'note', op: 'set' });
+        expect(event).not.toHaveProperty('value');
+    });
+
+    it.each(['read', 'write'] as const)(
+        'carries the value at %s',
+        async (access) => {
+            const prefix = region(`values-${access}`);
+            const { handle } = await share(prefix, access);
+            const sub = await watchValues(handle);
+
+            await expect(
+                deliveredAfter(sub.subId, () =>
+                    ownerWrites(`${prefix}note`, 'shown'),
+                ),
+            ).resolves.toMatchObject({ key: 'note', value: 'shown' });
+        },
+    );
+
+    it('follows a level change made after subscribing', async () => {
+        const prefix = region('values-change');
+        const { handle } = await share(prefix, 'read');
+        const sub = await watchValues(handle);
+        const write = (value: string) => () =>
+            ownerWrites(`${prefix}note`, value);
+
+        await expect(
+            deliveredAfter(sub.subId, write('one')),
+        ).resolves.toMatchObject({ value: 'one' });
+
+        await share(prefix, 'watch');
+        const lowered = await deliveredAfter(sub.subId, write('two'));
+        expect(lowered).toMatchObject({ key: 'note' });
+        expect(lowered).not.toHaveProperty('value');
+
+        await share(prefix, 'read');
+        await expect(
+            deliveredAfter(sub.subId, write('three')),
+        ).resolves.toMatchObject({ value: 'three' });
+    });
+
+    it('leaves the owner`s own subscription on the handle its values', async () => {
+        const prefix = region('values-owner');
+        const { handle } = await share(prefix, 'watch');
+        const sub = await watchValues(handle, owner);
+
+        await expect(
+            deliveredAfter(sub.subId, () =>
+                ownerWrites(`${prefix}note`, 'mine'),
+            ),
+        ).resolves.toMatchObject({ key: 'note', value: 'mine' });
     });
 });
 
@@ -653,6 +763,7 @@ describe('what has been shared with me', () => {
             access: 'write',
             appUid: GLOBAL,
             label: 'Plans',
+            notify: false,
             createdAt: expect.any(Number),
         });
         expect(page.items.some((row) => row.handle === gone.handle)).toBe(
@@ -1115,7 +1226,16 @@ describe('an app deletion that fails partway', () => {
         }
         expect((await handles().getByHandle(handle))?.revokedAt).toBeNull();
 
-        await deleted();
+        // The next check after its backoff retries it.
+        const now = Date.now.bind(Date);
+        const clock = vi
+            .spyOn(Date, 'now')
+            .mockImplementation(() => now() + 2 * 60_000);
+        try {
+            await shares().resumeKvShareJobs();
+        } finally {
+            clock.mockRestore();
+        }
         expect(await grantRows(guest, prefix, app.uid)).toEqual([]);
         expect(await handles().getByHandle(handle)).toMatchObject({
             revokedBy: 'system',
@@ -1404,6 +1524,7 @@ describe('an app checking a share through its user', () => {
 
     it('asks its user once, however deep the region', async () => {
         const app = await makeApp();
+        await authorizeApp(guest, app);
         const actor = appActorFor(guest, app);
         const permission = kvSharePermission(
             owner.uuid,
@@ -1423,6 +1544,7 @@ describe('an app checking a share through its user', () => {
 
     it('answers from the user`s grant on any ancestor, at its level or above, until it is revoked', async () => {
         const app = await makeApp();
+        await authorizeApp(guest, app);
         const actor = appActorFor(guest, app);
         const prefix = region('ancestor');
         const { handle } = await share(prefix, 'read', { appUid: app.uid });

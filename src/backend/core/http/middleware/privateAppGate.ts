@@ -25,7 +25,7 @@ import {
 } from '../../../services/auth/AuthService';
 import type { AppStore } from '../../../stores/app/AppStore.js';
 import type { IConfig } from '../../../types';
-import type { Actor } from '../../actor';
+import { isAccessTokenActor, isAccountContext, type Actor } from '../../actor';
 
 /**
  * Support helpers for the private-app access gate — ported from v1's
@@ -460,11 +460,15 @@ export async function resolvePrivateIdentity(opts: {
  * "No app anywhere in the chain" is the portable case, so read `effectiveApp` —
  * an app-issued access token has no `app` of its own and would otherwise pass
  * as a plain session on any private host.
+ *
+ * A scoped access token (a read URL, whoever issued it) is never the account
+ * here: the hosted cookie minted from it would outlive the token's revocation.
  */
 function actorMatchesExpectedApp(
     actor: Actor,
     expectedAppUid: string | undefined,
 ): boolean {
+    if (isAccessTokenActor(actor) && !isAccountContext(actor)) return false;
     if (!expectedAppUid) return true;
     const app = actor.effectiveApp;
     if (!app) return true;
@@ -472,9 +476,8 @@ function actorMatchesExpectedApp(
 }
 
 /**
- * Mirror of `resolvePrivateIdentity` for public hosted apps. Reads the sticky
- * `puter.public.hosted.actor.token` cookie first, then the same
- * session/bootstrap fallbacks.
+ * Fresh authenticated identities replace the sticky public billing cookie when
+ * the visitor switches accounts.
  */
 export async function resolvePublicHostedIdentity(opts: {
     req: Request;
@@ -495,37 +498,6 @@ export async function resolvePublicHostedIdentity(opts: {
 
     const cookies = (req as Request & { cookies?: Record<string, string> })
         .cookies;
-
-    const { name: publicCookieNameV2, legacyName: publicCookieNameLegacy } =
-        HOSTED_ASSET_COOKIES.public;
-    const publicCookieToken =
-        (typeof cookies?.[publicCookieNameV2] === 'string'
-            ? cookies[publicCookieNameV2]
-            : null) ??
-        (typeof cookies?.[publicCookieNameLegacy] === 'string'
-            ? cookies[publicCookieNameLegacy]
-            : null);
-    if (publicCookieToken) {
-        try {
-            const claims = await authService.verifyHostedAssetToken(
-                'public',
-                publicCookieToken,
-                {
-                    appUid: expectedAppUid,
-                    subdomain: expectedSubdomain,
-                    host: expectedHost,
-                },
-            );
-            return {
-                source: 'public-cookie',
-                userUid: claims.userUid,
-                sessionUuid: claims.sessionUuid,
-                hasValidPublicCookie: true,
-            };
-        } catch {
-            /* fall through — v1-signed cookies land here and get re-minted */
-        }
-    }
 
     const existingActor = req.actor;
     if (
@@ -579,6 +551,37 @@ export async function resolvePublicHostedIdentity(opts: {
             }
         } catch {
             /* fall through */
+        }
+    }
+
+    const { name: publicCookieNameV2, legacyName: publicCookieNameLegacy } =
+        HOSTED_ASSET_COOKIES.public;
+    const publicCookieToken =
+        (typeof cookies?.[publicCookieNameV2] === 'string'
+            ? cookies[publicCookieNameV2]
+            : null) ??
+        (typeof cookies?.[publicCookieNameLegacy] === 'string'
+            ? cookies[publicCookieNameLegacy]
+            : null);
+    if (publicCookieToken) {
+        try {
+            const claims = await authService.verifyHostedAssetToken(
+                'public',
+                publicCookieToken,
+                {
+                    appUid: expectedAppUid,
+                    subdomain: expectedSubdomain,
+                    host: expectedHost,
+                },
+            );
+            return {
+                source: 'public-cookie',
+                userUid: claims.userUid,
+                sessionUuid: claims.sessionUuid,
+                hasValidPublicCookie: true,
+            };
+        } catch {
+            /* fall through — v1-signed cookies land here and get re-minted */
         }
     }
 

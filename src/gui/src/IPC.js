@@ -29,15 +29,24 @@ import UIPopover from './UI/UIPopover.js';
 import UIPrompt from './UI/UIPrompt.js';
 import UIWindow from './UI/UIWindow.js';
 import UIWindowAppFeedback from './UI/UIWindowAppFeedback.js';
+import UIWindowAttachCustomDomain from './UI/UIWindowAttachCustomDomain.js';
 import UIWindowColorPicker from './UI/UIWindowColorPicker.js';
 import UIWindowEmailConfirmationRequired from './UI/UIWindowEmailConfirmationRequired.js';
 import UIWindowFontPicker from './UI/UIWindowFontPicker.js';
 import UIPermissionDialog from './UI/UIPermissionDialog.js';
+import UIEnablePushDialog from './UI/UIEnablePushDialog.js';
 import UIWindowSaveAccount from './UI/UIWindowSaveAccount.js';
 import UIWindowSignup from './UI/UIWindowSignup.js';
 import UINotification from './UI/UINotification.js';
 
 import { renewGodmodeToken } from './helpers/godmodeTokens.js';
+import { appHoldsPermissions } from './helpers/holdsPermissions.js';
+import {
+    browserPushState,
+    PUSH_PERMISSION,
+    pushClientWithin,
+    withEnableDeadline,
+} from './helpers/pushClient.js';
 import { ipc_target_window } from './helpers/ipcTargetWindow.js';
 import { addItemWatcher } from './helpers/watchItems.js';
 import { openVerificationGateWindow } from './helpers/verification_gates.js';
@@ -51,6 +60,30 @@ window.ipc_handlers = {};
 // handler below): one dialog at a time, and nothing else — reopening is always
 // allowed. See feedbackDialogGuard.js.
 const feedback_dialog_guard = createFeedbackDialogGuard();
+const enable_push_dialog_guard = createFeedbackDialogGuard();
+// Same one-at-a-time rule for the custom domain dialog.
+const custom_domain_dialog_guard = createFeedbackDialogGuard();
+
+/** For an app without `notifications:push`: the permission dialog, whose Allow also turns push on here. Resolves this browser's push state once that settles, `'off'` when denied. @returns {Promise<import('./helpers/pushClient.js').BrowserPushState>} */
+const ask_push_permission = async (app_uid, app_name) => {
+    if ( ! app_uid ) return 'unavailable';
+    const client = await pushClientWithin();
+    const state = await browserPushState(client);
+    // A grant can't turn push on in this browser.
+    if ( state === 'unavailable' || state === 'blocked' ) return state;
+    let enabling = null;
+    const granted = await UIPermissionDialog({
+        permission: PUSH_PERMISSION,
+        app_uid,
+        app_name,
+        on_push_enable: (promise) => {
+            enabling = promise;
+        },
+    });
+    if ( granted !== true ) return 'off';
+    if ( enabling ) await withEnableDeadline(enabling);
+    return await browserPushState(client);
+};
 
 /**
  * In Puter, apps are loaded in iframes and communicate with the graphical user interface (GUI), and each other, using the postMessage API.
@@ -160,8 +193,17 @@ const ipc_listener = async (event, handled) => {
         // Registered IPC handlers are an object with a `handle()`
         // method. We call it "spec" here, meaning specification.
         const spec = window.ipc_handlers[event.data.msg];
-        let retval = await spec.handler(event.data.parameters, { msg_id, ipc_context });
-
+        let retval;
+        try {
+            retval = await spec.handler(event.data.parameters, { msg_id, ipc_context });
+        } catch ( e ) {
+            console.error(`IPC handler ${event.data.msg} failed`, e);
+            // Generic on purpose: the error text stays out of the app.
+            retval = {
+                $: 'puter-ipc-error',
+                error: { code: 'ipc_handler_failed', message: 'The request could not be completed.' },
+            };
+        }
         puter.util.rpc.send(iframe.contentWindow, msg_id, retval);
 
         return;
@@ -1478,6 +1520,103 @@ const ipc_listener = async (event, handled) => {
             $(target_iframe).get(0)?.focus({ preventScroll: true });
         } finally {
             feedback_dialog_guard.markClosed();
+        }
+    }
+    // -- enablePush --
+    else if ( event.data.msg === 'enablePush' ) {
+        // Always respond, into an iframe that may be gone by then.
+        const respond = (state) => {
+            target_iframe?.contentWindow?.postMessage({
+                msg: 'pushEnabled',
+                state,
+                original_msg_id: msg_id,
+            }, '*');
+        };
+
+        // One dialog at a time, checked before the auth gate as for the feedback dialog.
+        if ( ! enable_push_dialog_guard.mayOpen() ) {
+            console.warn('IPC enablePush: a dialog is already open; ignoring this call');
+            respond('unavailable');
+            return;
+        }
+
+        enable_push_dialog_guard.markOpened();
+        try {
+            try {
+                if ( !window.is_auth() && !(await UIWindowSignup({ referrer: app_name })) )
+                {
+                    respond('unavailable');
+                    return;
+                }
+            } catch ( e ) {
+                console.error('IPC enablePush: auth gate failed', e);
+                respond('unavailable');
+                return;
+            }
+
+            let state = 'unavailable';
+            try {
+                // The push dialog says this app wants to send pushes, so an app that may not asks for that first.
+                state = await appHoldsPermissions([PUSH_PERMISSION], app_uuid)
+                    ? await UIEnablePushDialog({ app_name })
+                    : await ask_push_permission(app_uuid, app_name);
+            } catch ( e ) {
+                console.error('IPC enablePush failed', e);
+            }
+            respond(state);
+            $(target_iframe).get(0)?.focus({ preventScroll: true });
+        } finally {
+            enable_push_dialog_guard.markClosed();
+        }
+    }
+    //--------------------------------------------------------
+    // attachCustomDomain
+    //--------------------------------------------------------
+    else if ( event.data.msg === 'attachCustomDomain' ) {
+        // Always answer, as for showFeedbackDialog: the SDK promise only
+        // settles on a reply.
+        const respond = (domain) => {
+            target_iframe?.contentWindow?.postMessage({
+                msg: 'customDomainAttached',
+                domain: domain ?? null,
+                original_msg_id: msg_id,
+            }, '*');
+        };
+
+        const subdomain = typeof event.data.subdomain === 'string' ? event.data.subdomain : '';
+        if ( ! subdomain || ! custom_domain_dialog_guard.mayOpen() ) {
+            respond(null);
+            return;
+        }
+
+        custom_domain_dialog_guard.markOpened();
+        try {
+            try {
+                if ( !window.is_auth() && !(await UIWindowSignup({ referrer: app_name })) ) {
+                    respond(null);
+                    return;
+                }
+            } catch ( e ) {
+                console.error('IPC attachCustomDomain: auth gate failed', e);
+                respond(null);
+                return;
+            }
+
+            let domain = null;
+            try {
+                // The requester shown is the app's registered name from the
+                // GUI's own records; its window title is app-controlled.
+                domain = await UIWindowAttachCustomDomain({
+                    subdomain,
+                    requester: app_name,
+                });
+            } catch ( e ) {
+                console.error('IPC attachCustomDomain failed', e);
+            }
+            respond(domain);
+            $(target_iframe).get(0)?.focus({ preventScroll: true });
+        } finally {
+            custom_domain_dialog_guard.markClosed();
         }
     }
     //--------------------------------------------------------

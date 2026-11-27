@@ -63,10 +63,17 @@ export interface KnownContextFields {
     driverName: string;
     /**
      * Aborts when the client disconnects before the response has finished (set
-     * by DriverController). Long-running drivers poll it so work nobody will
-     * receive stops early and is never metered.
+     * by DriverController). Some drivers (Gemini, Replicate) stop early on it.
+     * Async video and image jobs keep polling and are metered after a
+     * disconnect, since the provider bills them either way.
      */
     abortSignal: AbortSignal;
+    /**
+     * Keeps the call's concurrency slot until `work` settles (set by
+     * DriverController when the method is capped), for work that outlives the
+     * response.
+     */
+    keepDriverSlot: (work: Promise<unknown>) => void;
     /**
      * Aborts the chat driver's upstream request. A client disconnect doesn't
      * fire it: the upstream bills a request it has accepted either way, so the
@@ -80,6 +87,11 @@ export interface KnownContextFields {
      * different provider's translation of it.
      */
     strictUpstreamErrors: boolean;
+    /**
+     * Set while Puter files something into an account for it (mail delivery),
+     * so filesystem events never report that write as the request actor's own.
+     */
+    platformWrite: boolean;
 }
 
 // Every key of `KnownContextFields`, checked both ways by the compiler, so
@@ -90,8 +102,10 @@ const KNOWN_KEY_FLAGS: Record<keyof KnownContextFields, true> = {
     requestId: true,
     driverName: true,
     abortSignal: true,
+    keepDriverSlot: true,
     upstreamSignal: true,
     strictUpstreamErrors: true,
+    platformWrite: true,
 };
 const KNOWN_KEYS: ReadonlySet<string> = new Set(Object.keys(KNOWN_KEY_FLAGS));
 

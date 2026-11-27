@@ -75,6 +75,15 @@ export type EventMap = {
     serverStart: Record<string, never>;
     serverPrepareShutdown: Record<string, never>;
     serverShutdown: Record<string, never>;
+    /**
+     * Emitted by a host extension that knows this server will restart soon.
+     * Long-lived connections ask their clients to reconnect; nothing is refused
+     * or closed, so a false alarm is harmless.
+     */
+    serverRestartAnnounced: {
+        /** How long until the server stops, when known. */
+        closeInMs?: number;
+    };
 
     // ---- AI ----
     'ai.prompt.validate': {
@@ -137,6 +146,17 @@ export type EventMap = {
     };
     'app.new-icon': { app_uid: string; data_url: string };
     'app.opened': { app_uid: string; user_id: number; ts: number };
+    /**
+     * A user removed an app: its grants and worker sessions are gone. With
+     * `deleteData`, the user asked for the app's data in their account to go
+     * too. Awaited by the emitter.
+     */
+    'app.uninstalled': {
+        userId: number;
+        userUuid: string;
+        appUid: string;
+        deleteData: boolean;
+    };
     'app.rename': {
         app_uid: string;
         old_name: string;
@@ -197,7 +217,7 @@ export type EventMap = {
          */
         is_temp?: boolean;
         ip?: string | null;
-        source?: 'oidc';
+        source?: 'oidc' | 'team_provision';
         req?: unknown;
         data?: unknown;
         abuse?: unknown;
@@ -257,7 +277,7 @@ export type EventMap = {
         ip?: string | null;
         fingerprint?: string | null;
         reputation?: number | null;
-        source?: 'oidc';
+        source?: 'oidc' | 'team_provision';
         requires_phone_verification: boolean;
         requires_card_verification: boolean;
         accepted: boolean;
@@ -389,6 +409,9 @@ export type EventMap = {
         new_username: string;
     };
     'user.email-changed': { user_id: number; new_email: string };
+    /** An account was suspended, or its suspension lifted. Local events. */
+    'user.suspended': { userId: number };
+    'user.unsuspended': { userId: number };
     // Fired after an account is torn down (self-serve, admin, or temp-user
     // logout cleanup). Listeners purge external state tied to the account —
     // e.g. the marketplace extension cancels the user's Stripe subscriptions.
@@ -535,8 +558,27 @@ export type EventMap = {
         appUid: string | null;
         value: Record<string, unknown>;
         createdAt: number;
+        /** An earlier notification replaced in place; `createdAt` is when. */
+        replaced?: true;
         /** Events handler runs behind whatever created it. */
         handlerDepth?: number;
+    };
+    /**
+     * Every non-silent write or update, only on the node that wrote it. The
+     * value is the listener's own copy of what the socket carries.
+     */
+    'notif.written': {
+        userId: number;
+        uid: string;
+        type: string;
+        audience: string;
+        /** The row's app; null when it names none or an update could not tell. */
+        appUid: string | null;
+        value: Record<string, unknown>;
+        /** An earlier notification rewritten in place. */
+        updated?: true;
+        /** Names this one send, for a receipt asked about it. */
+        sendId: string;
     };
     /**
      * One notification, addressed at whatever sockets each region holds for the
@@ -546,8 +588,30 @@ export type EventMap = {
      */
     'outer.notif.delivery': {
         userId: number;
-        wire: 'notif.message' | 'notif.unreads' | 'notif.ack';
+        wire: 'notif.message' | 'notif.unreads' | 'notif.ack' | 'notif.removed';
         response: unknown;
+    };
+    /**
+     * How one live notification went, on the node that asked for its receipt:
+     * from the desktop's sockets, or with `appUid` the app's own.
+     */
+    'notif.delivery.settled': {
+        sendId?: string;
+        uid: string;
+        userId: number;
+        type: string;
+        /** The app whose own sockets were asked; absent for the desktop's. */
+        appUid?: string;
+        outcome: NotifDeliveryOutcome;
+        /** A socket in this region acknowledges the receipt. */
+        ackCapable: boolean;
+        /** No socket here is an older client that acknowledges nothing. */
+        everySocketAcks: boolean;
+        /** Every node here answered the ask, not just this one. */
+        complete: boolean;
+        /** A peer region holds a socket for the user. */
+        peerRegions: boolean;
+        responders: NotifDeliveryResponder[];
     };
 
     // ---- Metering ----
@@ -665,6 +729,13 @@ export type EventMap = {
      * reason as the events generation bump: a per-process cache.
      */
     'outer.pubsub.share.ownerShared': { ownerUserId: number };
+    /**
+     * Share handles were retired or changed, so every process must drop its
+     * cached copy. `outer.pubsub.*` because the cache is a per-process map.
+     */
+    'outer.pubsub.kv.share.forget': { handles: string[] };
+    /** The same, for every cached handle one owner holds out. */
+    'outer.pubsub.kv.share.forgetOwner': { ownerUserId: number };
     'outer.fs.write-hash': { hash: string; uuid: string };
     /**
      * Cache keys the KV read cache must stop serving, because the entries
@@ -683,6 +754,7 @@ export type EventMap = {
     'outer.gui.item.renamed': GuiEvent;
     'outer.gui.notif.ack': GuiEvent<{ uid: string }>;
     'outer.gui.notif.message': GuiEvent<{ uid: string; notification: unknown }>;
+    'outer.gui.notif.removed': GuiEvent<{ uid: string }>;
     'outer.gui.notif.unreads': GuiEvent<{
         unreads: { uid: string; notification: unknown }[];
     }>;
@@ -690,7 +762,7 @@ export type EventMap = {
     // ---- Subdomains ----
     // `uid` is the row uuid — for `delete` it is the only surviving handle a
     // listener can use to find state keyed to the row after it is gone.
-    'subdomain.delete': { subdomain: string; uid?: string };
+    'subdomain.delete': { subdomain: string; uid?: string; userId: number };
     'subdomain.update': { subdomain: string; uid?: string };
     'site.htmlServed': {
         subdomain: string;
@@ -949,11 +1021,10 @@ export type EventKey = keyof EventMap & string;
 // Generates a wildcard for every non-final dot-separated prefix of K.
 export type WildcardPrefixes<K extends string> =
     K extends `${infer Head}.${infer Tail}`
-        ?
-              | `${Head}.*`
-              | (Tail extends `${string}.${string}`
-                    ? `${Head}.${WildcardPrefixes<Tail>}`
-                    : never)
+        ? | `${Head}.*`
+          | (Tail extends `${string}.${string}`
+                ? `${Head}.${WildcardPrefixes<Tail>}`
+                : never)
         : never;
 
 export type ListenKey = EventKey | WildcardPrefixes<EventKey>;
@@ -961,6 +1032,22 @@ export type ListenKey = EventKey | WildcardPrefixes<EventKey>;
 export type MatchingEvents<P extends ListenKey> = P extends `${infer Prefix}.*`
     ? Extract<EventKey, `${Prefix}.${string}`>
     : P & EventKey;
+
+/** Acked, not acked, no socket anywhere, or sockets only in a peer region. */
+export type NotifDeliveryOutcome =
+    'received' | 'unreceived' | 'no-socket' | 'remote-only';
+
+/** One socket's receipt for a live notification. */
+export interface NotifDeliveryResponder {
+    visibilityState: 'visible' | 'hidden' | 'unknown';
+    /** The page's window has focus. Absent from older clients. */
+    focused?: boolean;
+    /**
+     * The page shows its own browser notification while hidden or unfocused.
+     * Absent from older clients.
+     */
+    showsOwn?: boolean;
+}
 
 export type EventMetadata = {
     from_outside?: boolean;

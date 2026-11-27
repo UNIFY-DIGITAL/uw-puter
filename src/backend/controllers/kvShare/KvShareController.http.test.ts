@@ -34,7 +34,16 @@ import {
     type TestUserCredentials,
 } from '../../testUtil.js';
 import type { IConfig } from '../../types.js';
-import { EVENTS_KV_HANDLE_LIMIT } from '../events/limits.js';
+import { claimRateLimit } from '../../core/http/middleware/rateLimit.js';
+import { seedKvShareHandles } from '../../services/kvShare/kvShareTestUtil.js';
+import { KV_GLOBAL_APP_KEY } from '../../stores/systemKv/SystemKVStore.js';
+import {
+    EVENTS_KV_HANDLE_LIMIT,
+    EVENTS_KV_HANDLES_PER_USER,
+    KV_SHARE_BATCH_MAX,
+    KV_SHARE_GRANT_LIMITS,
+    KV_SHARE_LOOKUP_LIMIT,
+} from '../events/limits.js';
 
 const BOOT_TIMEOUT_MS = 120_000;
 
@@ -57,9 +66,12 @@ const call = (
 const resetBudgets = async (env: PuterTestEnv) => {
     for (const name of [env.users.user.username, env.users.other.username]) {
         const user = await env.server.stores.user.getByUsername(name);
-        await env.server.clients.redis.del(
-            `rate:${EVENTS_KV_HANDLE_LIMIT.scope}:${user!.id}`,
-        );
+        for (const scope of [
+            EVENTS_KV_HANDLE_LIMIT.scope,
+            KV_SHARE_LOOKUP_LIMIT.scope,
+            ...KV_SHARE_GRANT_LIMITS.map((window) => window.scope),
+        ])
+            await env.server.clients.redis.del(`rate:${scope}:${user!.id}`);
     }
 };
 
@@ -113,6 +125,7 @@ describe('/kv/shares', () => {
                 'handle',
                 'holder',
                 'label',
+                'notify',
                 'prefix',
             ].sort(),
         );
@@ -121,6 +134,42 @@ describe('/kv/shares', () => {
             appUid: null,
             holder: env.users.other.username,
             label: 'Groceries',
+            notify: false,
+        });
+    });
+
+    it('takes notify, keeps it on a re-share that leaves it out, and shows it to both sides', async () => {
+        const prefix = `notify-${uuidv4().slice(0, 8)}:`;
+        const on = await shareWithOther({ prefix, notify: true });
+        expect(on).toMatchObject({ prefix, notify: true });
+
+        const kept = await shareWithOther({ prefix, access: 'write' });
+        expect(kept).toMatchObject({ handle: on.handle, notify: true });
+
+        const listed = async (path: string, token: string) =>
+            (
+                (await (await req('GET', path, token)).json()) as {
+                    items: Array<Record<string, unknown>>;
+                }
+            ).items.find((row) => row.handle === on.handle);
+        expect(
+            await listed('/kv/shares?limit=200', env.users.user.token),
+        ).toMatchObject({ notify: true });
+        expect(
+            await listed('/kv/shares/with-me?limit=200', env.users.other.token),
+        ).toMatchObject({ notify: true });
+
+        const off = await shareWithOther({ prefix, notify: false });
+        expect(off).toMatchObject({ handle: on.handle, notify: false });
+
+        const refused = await req('POST', '/kv/shares', env.users.user.token, {
+            prefix,
+            recipient: env.users.other.username,
+            notify: 'yes',
+        });
+        expect(refused.status).toBe(400);
+        await expect(refused.json()).resolves.toMatchObject({
+            code: 'kv_share_notify_invalid',
         });
     });
 
@@ -159,6 +208,7 @@ describe('/kv/shares', () => {
             appUid: null,
             holder: env.users.other.username,
             label: 'Trip',
+            notify: false,
             createdAt: shared.createdAt,
             revokedAt: null,
             revokedBy: null,
@@ -180,6 +230,7 @@ describe('/kv/shares', () => {
             access: 'write',
             appUid: null,
             label: 'Trip',
+            notify: false,
             createdAt: shared.createdAt,
         });
         expect(withMeText).not.toContain(env.users.user.username);
@@ -292,6 +343,481 @@ describe('/kv/shares', () => {
     it('turns an anonymous caller away', async () => {
         const res = await req('GET', '/kv/shares');
         expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    describe('filtering a listing', () => {
+        type Page = { items: Array<Record<string, unknown>>; total?: number };
+        let appUid: string;
+        let inApp: Record<string, unknown>;
+        let global: Record<string, unknown>;
+
+        const page = async (path: string, token: string) => {
+            const res = await req('GET', path, token);
+            return { status: res.status, body: (await res.json()) as Page };
+        };
+        const handlesOf = (body: Page) => body.items.map((row) => row.handle);
+
+        const makeApp = async () => {
+            const owner = await env.server.stores.user.getByUsername(
+                env.users.user.username,
+            );
+            const name = `kv-http-${uuidv4().slice(0, 8)}`;
+            return env.server.stores.app.create(
+                {
+                    name,
+                    title: 'Listing App',
+                    index_url: `https://${name}.example.test/index.html`,
+                },
+                { ownerUserId: owner!.id },
+            );
+        };
+
+        /** The token the desktop launches the app with, for `token`'s user. */
+        const appToken = async (token: string, uid: string) => {
+            const res = await req('POST', '/auth/get-user-app-token', token, {
+                app_uid: uid,
+            });
+            expect(res.status).toBe(200);
+            return ((await res.json()) as { token: string }).token;
+        };
+
+        beforeAll(async () => {
+            await resetBudgets(env);
+            appUid = (await makeApp()).uid;
+            inApp = await shareWithOther({ appUid });
+            global = await shareWithOther();
+        });
+
+        it('lists every app`s shares for the account, or one app`s, or the app-less store`s with `null`', async () => {
+            for (const path of ['/kv/shares', '/kv/shares/with-me']) {
+                const token =
+                    path === '/kv/shares'
+                        ? env.users.user.token
+                        : env.users.other.token;
+                const all = await page(`${path}?limit=200`, token);
+                expect(handlesOf(all.body)).toEqual(
+                    expect.arrayContaining([inApp.handle, global.handle]),
+                );
+
+                const one = await page(
+                    `${path}?limit=200&appUid=${appUid}`,
+                    token,
+                );
+                expect(handlesOf(one.body)).toEqual([inApp.handle]);
+
+                const appLess = await page(
+                    `${path}?limit=200&appUid=null`,
+                    token,
+                );
+                expect(handlesOf(appLess.body)).toContain(global.handle);
+                expect(
+                    appLess.body.items.every((row) => row.appUid === null),
+                ).toBe(true);
+
+                const bad = await page(`${path}?appUid=not-an-app`, token);
+                expect(bad.status).toBe(400);
+            }
+        });
+
+        it('keeps an app to its own namespace, refusing any other it names', async () => {
+            const token = await appToken(env.users.other.token, appUid);
+            const own = await page('/kv/shares/with-me?limit=200', token);
+            expect(handlesOf(own.body)).toEqual([inApp.handle]);
+            const named = await page(
+                `/kv/shares/with-me?limit=200&appUid=${appUid}`,
+                token,
+            );
+            expect(handlesOf(named.body)).toEqual([inApp.handle]);
+
+            const otherApp = (await makeApp()).uid;
+            for (const appUidParam of ['null', otherApp]) {
+                const refused = await page(
+                    `/kv/shares/with-me?appUid=${appUidParam}`,
+                    token,
+                );
+                expect(refused.status).toBe(403);
+                expect(refused.body).toMatchObject({
+                    code: 'events_kv_handle_outside_namespace',
+                });
+            }
+        });
+
+        it('narrows what was shared out to live or revoked shares, all by default', async () => {
+            const gone = await shareWithOther({ appUid });
+            await req(
+                'DELETE',
+                `/kv/shares/${gone.handle}`,
+                env.users.user.token,
+            );
+            const at = async (state?: string) =>
+                page(
+                    `/kv/shares?limit=200&appUid=${appUid}` +
+                        (state ? `&state=${state}` : ''),
+                    env.users.user.token,
+                );
+
+            expect(handlesOf((await at()).body)).toEqual([
+                inApp.handle,
+                gone.handle,
+            ]);
+            expect(handlesOf((await at('all')).body)).toEqual([
+                inApp.handle,
+                gone.handle,
+            ]);
+            expect(handlesOf((await at('live')).body)).toEqual([inApp.handle]);
+            expect(handlesOf((await at('revoked')).body)).toEqual([
+                gone.handle,
+            ]);
+            const bad = await at('stopped');
+            expect(bad.status).toBe(400);
+        });
+    });
+
+    describe('with several recipients', () => {
+        let third: { username: string; uuid: string; id: number };
+        // Holds seeded rows, so no recipient's per-holder cap is what trips.
+        let filler: number;
+        let ownerId: number;
+
+        beforeAll(async () => {
+            const username = `kv-batch-${uuidv4().slice(0, 8)}`;
+            await createTestUser(env.server, {
+                username,
+                password: 'pw-test-1234',
+            });
+            const row = await env.server.stores.user.getByUsername(username);
+            third = { username, uuid: row!.uuid as string, id: row!.id! };
+            ownerId = (await env.server.stores.user.getByUsername(
+                env.users.user.username,
+            ))!.id!;
+            const fillerName = `kv-filler-${uuidv4().slice(0, 8)}`;
+            await createTestUser(env.server, {
+                username: fillerName,
+                password: 'pw-test-1234',
+            });
+            filler = (await env.server.stores.user.getByUsername(fillerName))!
+                .id!;
+        });
+
+        const shareMany = (body: Record<string, unknown>) =>
+            req('POST', '/kv/shares', env.users.user.token, {
+                prefix: `batch-${uuidv4().slice(0, 8)}:`,
+                ...body,
+            });
+
+        it('reports each recipient on its own item, in order', async () => {
+            const res = await shareMany({
+                recipients: [
+                    env.users.other.username,
+                    'nobody-by-this-name',
+                    env.users.user.username,
+                    'someone@example.com',
+                    { uid: third.uuid },
+                ],
+                access: 'write',
+                label: 'Team list',
+            });
+            expect(res.status).toBe(200);
+            const { items } = (await res.json()) as {
+                items: Record<string, unknown>[];
+            };
+            expect(items).toHaveLength(5);
+            expect(items[0]).toMatchObject({
+                recipient: env.users.other.username,
+                handle: expect.any(String),
+                access: 'write',
+                holder: env.users.other.username,
+                label: 'Team list',
+                appUid: null,
+            });
+            expect(items[1]).toEqual({
+                recipient: 'nobody-by-this-name',
+                error: {
+                    message: expect.any(String),
+                    code: 'subject_does_not_exist',
+                },
+            });
+            expect(items[2]).toMatchObject({
+                error: { code: 'bad_request' },
+            });
+            expect(items[3]).toMatchObject({
+                error: { code: 'invalid_recipient' },
+            });
+            expect(items[4]).toMatchObject({
+                recipient: { uid: third.uuid },
+                holder: third.username,
+            });
+            expect(items[4].handle).not.toBe(items[0].handle);
+        });
+
+        it('answers a recipient named twice with the one share', async () => {
+            const res = await shareMany({
+                recipients: [third.username, { uid: third.uuid }],
+            });
+            const { items } = (await res.json()) as {
+                items: Record<string, unknown>[];
+            };
+            expect(items[0].handle).toEqual(expect.any(String));
+            expect(items[1].handle).toBe(items[0].handle);
+        });
+
+        it('refuses a malformed batch outright', async () => {
+            for (const body of [
+                { recipients: [] },
+                { recipients: 'alice' },
+                {
+                    recipients: Array.from(
+                        { length: KV_SHARE_BATCH_MAX + 1 },
+                        (_, i) => `user-${i}`,
+                    ),
+                },
+                {
+                    recipient: env.users.other.username,
+                    recipients: [env.users.other.username],
+                },
+            ]) {
+                const res = await shareMany(body);
+                expect(res.status).toBe(400);
+                await expect(res.json()).resolves.toMatchObject({
+                    code: 'bad_request',
+                });
+            }
+        });
+
+        it('refuses the whole batch when it would pass the account cap', async () => {
+            const prefix = `batch-cap-${uuidv4().slice(0, 8)}:`;
+            const existing = await shareMany({
+                prefix,
+                recipients: [env.users.other.username],
+            });
+            const [standing] = (
+                (await existing.json()) as { items: { handle: string }[] }
+            ).items;
+            try {
+                const { total } =
+                    await env.server.stores.kvShareHandle.countLiveForOwner(
+                        ownerId,
+                    );
+                // One slot left.
+                await seedKvShareHandles(env.server, {
+                    ownerUserId: ownerId,
+                    ownerUuid,
+                    granteeUserId: filler,
+                    count: EVENTS_KV_HANDLES_PER_USER.limit - total - 1,
+                    appUid: () => KV_GLOBAL_APP_KEY,
+                });
+
+                const refused = await shareMany({
+                    prefix: `batch-over-${uuidv4().slice(0, 8)}:`,
+                    recipients: [env.users.other.username, third.username],
+                });
+                expect(refused.status).toBe(409);
+                await expect(refused.json()).resolves.toMatchObject({
+                    code: 'events_kv_handle_limit_reached',
+                });
+                expect(
+                    (
+                        await env.server.stores.kvShareHandle.countLiveForOwner(
+                            ownerId,
+                        )
+                    ).total,
+                ).toBe(EVENTS_KV_HANDLES_PER_USER.limit - 1);
+
+                // The standing share takes no slot, so one new one still fits.
+                const fits = await shareMany({
+                    prefix,
+                    recipients: [env.users.other.username, third.username],
+                });
+                expect(fits.status).toBe(200);
+                const { items } = (await fits.json()) as {
+                    items: Record<string, unknown>[];
+                };
+                expect(items[0].handle).toBe(standing.handle);
+                expect(items[1]).toMatchObject({ holder: third.username });
+            } finally {
+                await env.server.clients.db.write(
+                    'DELETE FROM `kv_share_handles` WHERE `owner_user_id` = ?',
+                    [ownerId],
+                );
+            }
+        });
+
+        it('spends the grant budget per recipient, all or nothing', async () => {
+            const [minute] = KV_SHARE_GRANT_LIMITS;
+            await claimRateLimit(
+                `${minute.scope}:${ownerId}`,
+                minute.limit,
+                minute.window,
+                minute.limit - 1,
+            );
+            try {
+                const refused = await shareMany({
+                    recipients: [env.users.other.username, third.username],
+                });
+                expect(refused.status).toBe(429);
+                await expect(refused.json()).resolves.toMatchObject({
+                    code: 'too_many_requests',
+                });
+            } finally {
+                await resetBudgets(env);
+            }
+        });
+    });
+
+    describe('sharing again', () => {
+        let ownerId: number;
+        let third: string;
+
+        beforeAll(async () => {
+            third = `kv-again-${uuidv4().slice(0, 8)}`;
+            await createTestUser(env.server, {
+                username: third,
+                password: 'pw-test-1234',
+            });
+            ownerId = (await env.server.stores.user.getByUsername(
+                env.users.user.username,
+            ))!.id!;
+        });
+
+        const shareAt = (prefix: string, body: Record<string, unknown>) =>
+            req('POST', '/kv/shares', env.users.user.token, {
+                prefix,
+                ...body,
+            });
+
+        /** Leaves `left` units in one of the owner's windows. */
+        const drain = (
+            window: { scope: string; limit: number; window: number },
+            left = 0,
+        ) =>
+            claimRateLimit(
+                `${window.scope}:${ownerId}`,
+                window.limit,
+                window.window,
+                window.limit - left,
+            );
+
+        it('spends neither the mint nor the grant budget when every share stays as it is', async () => {
+            const prefix = `again-${uuidv4().slice(0, 8)}:`;
+            const recipients = [env.users.other.username, third];
+            const made = (await (
+                await shareAt(prefix, { recipients, label: 'Room' })
+            ).json()) as { items: Array<{ handle: string }> };
+            await drain(EVENTS_KV_HANDLE_LIMIT);
+            for (const window of KV_SHARE_GRANT_LIMITS) await drain(window);
+            try {
+                const again = await shareAt(prefix, {
+                    recipients: [...recipients, third],
+                });
+                expect(again.status).toBe(200);
+                const { items } = (await again.json()) as {
+                    items: Array<{ handle: string; label: string }>;
+                };
+                expect(items.map((item) => item.handle)).toEqual([
+                    made.items[0].handle,
+                    made.items[1].handle,
+                    made.items[1].handle,
+                ]);
+                expect(items[0].label).toBe('Room');
+
+                const single = await shareAt(prefix, {
+                    recipient: env.users.other.username,
+                    access: 'read',
+                });
+                expect(single.status).toBe(200);
+            } finally {
+                await resetBudgets(env);
+            }
+        });
+
+        it('spends the mint budget on a change, and grant units only on recipients without the share', async () => {
+            const prefix = `again-${uuidv4().slice(0, 8)}:`;
+            const other = env.users.other.username;
+            expect((await shareAt(prefix, { recipient: other })).status).toBe(
+                200,
+            );
+            for (const window of KV_SHARE_GRANT_LIMITS) await drain(window);
+            try {
+                // A level change on a standing share takes no grant unit.
+                const raised = await shareAt(prefix, {
+                    recipients: [other],
+                    access: 'write',
+                });
+                expect(raised.status).toBe(200);
+
+                // Naming an unknown user next to it costs what a new share
+                // would, so the window refuses both.
+                for (const extra of ['nobody-by-this-name', third]) {
+                    const refused = await shareAt(prefix, {
+                        recipients: [other, extra],
+                        access: 'write',
+                    });
+                    expect(refused.status).toBe(429);
+                }
+            } finally {
+                await resetBudgets(env);
+            }
+
+            await drain(EVENTS_KV_HANDLE_LIMIT);
+            try {
+                const lowered = await shareAt(prefix, {
+                    recipient: other,
+                    access: 'read',
+                });
+                expect(lowered.status).toBe(429);
+                await expect(lowered.json()).resolves.toMatchObject({
+                    code: 'too_many_requests',
+                });
+            } finally {
+                await resetBudgets(env);
+            }
+        });
+
+        it('counts turning notify on or off as a change', async () => {
+            const prefix = `again-${uuidv4().slice(0, 8)}:`;
+            const other = env.users.other.username;
+            expect((await shareAt(prefix, { recipient: other })).status).toBe(
+                200,
+            );
+            await drain(EVENTS_KV_HANDLE_LIMIT);
+            try {
+                expect(
+                    (await shareAt(prefix, { recipient: other })).status,
+                ).toBe(200);
+                expect(
+                    (
+                        await shareAt(prefix, {
+                            recipient: other,
+                            notify: true,
+                        })
+                    ).status,
+                ).toBe(429);
+            } finally {
+                await resetBudgets(env);
+            }
+        });
+
+        it('spends the lookup budget on every recipient named', async () => {
+            const prefix = `again-${uuidv4().slice(0, 8)}:`;
+            const other = env.users.other.username;
+            expect((await shareAt(prefix, { recipient: other })).status).toBe(
+                200,
+            );
+            await resetBudgets(env);
+            await drain(KV_SHARE_LOOKUP_LIMIT, 1);
+            try {
+                expect(
+                    (await shareAt(prefix, { recipient: other })).status,
+                ).toBe(200);
+                const refused = await shareAt(prefix, { recipient: other });
+                expect(refused.status).toBe(429);
+                await expect(refused.json()).resolves.toMatchObject({
+                    code: 'too_many_requests',
+                });
+            } finally {
+                await resetBudgets(env);
+            }
+        });
     });
 });
 

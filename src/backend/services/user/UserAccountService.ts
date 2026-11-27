@@ -120,6 +120,15 @@ export class UserAccountService extends PuterService {
             ownerUserId: userId,
         });
 
+        // Handles the account holds cascade with the row and nothing is told,
+        // so what their owners subscribed to through them would stay active
+        // and silent. Retiring them first ends those subscriptions.
+        try {
+            await this.services.kvShare.retireForDeletedHolder(userId);
+        } catch (e) {
+            console.warn('[cascade-delete-user] kv share retire failed:', e);
+        }
+
         // Sessions FK is SET NULL, so delete explicitly to avoid dangling rows.
         await this.clients.db.write(
             'DELETE FROM `sessions` WHERE `user_id` = ?',
@@ -141,6 +150,17 @@ export class UserAccountService extends PuterService {
                     e,
                 );
             }
+        }
+
+        // Grants the account held live in the flat view under its id, which
+        // nothing else removes.
+        try {
+            await this.stores.permission.purgeFlatUserPermsHeldBy(userId);
+        } catch (e) {
+            console.warn(
+                '[cascade-delete-user] held-grant flat purge failed:',
+                e,
+            );
         }
 
         // Fire-and-forget: let listeners purge external state tied to the
@@ -211,7 +231,11 @@ export class UserAccountService extends PuterService {
                 try {
                     this.clients.event.emit(
                         'subdomain.delete',
-                        { subdomain: row.subdomain, uid: String(row.uuid) },
+                        {
+                            subdomain: row.subdomain,
+                            uid: String(row.uuid),
+                            userId,
+                        },
                         {},
                     );
                 } catch {

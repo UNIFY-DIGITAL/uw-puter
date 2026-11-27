@@ -19,7 +19,10 @@
 
 import MockRedis from 'ioredis-mock';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { EVENTS_SESSION_SUBSCRIPTIONS_PER_SOCKET } from '../../controllers/events/limits.js';
+import {
+    EVENTS_SESSION_SUBSCRIPTIONS_PER_KV_HANDLE,
+    EVENTS_SESSION_SUBSCRIPTIONS_PER_SOCKET,
+} from '../../controllers/events/limits.js';
 import { isHttpError } from '../../core/http/HttpError.js';
 import type { IConfig } from '../../types.js';
 import {
@@ -254,6 +257,200 @@ describe('the per-socket cap', () => {
         expect(await redis.scard(`ev:s:{${USER}}:socket-a`)).toBe(
             EVENTS_SESSION_SUBSCRIPTIONS_PER_SOCKET,
         );
+    });
+});
+
+describe('rows made through a share handle', () => {
+    const HANDLE = 'kvh-handle-a';
+    const OTHER_HANDLE = 'kvh-handle-b';
+
+    /** A row in `USER`'s keyspace, made through a handle by `holderUserId`. */
+    const through = (
+        holderUserId: number,
+        i: number,
+        over: Partial<SessionSubscription> = {},
+    ): SessionSubscription =>
+        makeSub({
+            subId: `h-${holderUserId}-${i}`,
+            // Spread over connections so the per-socket cap never binds.
+            socketId: `socket-${Math.floor(i / 10)}`,
+            holderUserId,
+            ownerUserId: USER,
+            subject: `kv:${HANDLE}:*`,
+            token: `k#owner#app#ws:`,
+            anchorUid: 'app',
+            anchorPath: 'ws:',
+            permission: 'kv-share:owner:app:ws',
+            ...over,
+        });
+
+    it('doesn`t let connections that dropped without being reaped refuse a new one', async () => {
+        const holder = USER + 7000;
+        const full = EVENTS_SESSION_SUBSCRIPTIONS_PER_SOCKET;
+        // Two connections at their cap through one handle, gone but not
+        // reaped: a crashed node, or a blip the server hasn't noticed yet.
+        for (const socketId of ['socket-old-1', 'socket-old-2'])
+            for (let i = 0; i < full; i++)
+                await store.add(
+                    through(holder, i, {
+                        subId: `${socketId}-${i}`,
+                        socketId,
+                    }),
+                );
+
+        for (let i = 0; i < full; i++)
+            await expect(
+                store.add(
+                    through(holder, i, {
+                        subId: `socket-new-${i}`,
+                        socketId: 'socket-new',
+                    }),
+                ),
+            ).resolves.toMatchObject({ userId: USER });
+    });
+
+    it('takes a row out of its handle`s index when it goes', async () => {
+        const holder = USER + 7000;
+        const unsubscribed = through(holder, 0, { socketId: 'socket-a' });
+        const reaped = through(holder, 1, { socketId: 'socket-b' });
+        await store.add(unsubscribed);
+        await store.add(reaped);
+        expect(await redis.scard(`ev:kh:{${USER}}:${HANDLE}`)).toBe(2);
+
+        await store.remove(unsubscribed);
+        await store.reapSocket(holder, 'socket-b');
+
+        expect(await redis.scard(`ev:kh:{${USER}}:${HANDLE}`)).toBe(0);
+    });
+
+    it('holds another user to a loose cap through one handle, across their connections', async () => {
+        const cap = EVENTS_SESSION_SUBSCRIPTIONS_PER_KV_HANDLE;
+        const isLimit = (err: unknown) =>
+            isHttpError(err) &&
+            err.statusCode === 429 &&
+            err.legacyCode === 'events_subscription_limit';
+        const holder = USER + 7000;
+        for (let i = 0; i < 10; i++) await store.add(through(USER, i));
+        for (let i = 0; i < cap; i++) await store.add(through(holder, i));
+
+        const overflow = through(holder, cap);
+        await expect(store.add(overflow)).rejects.toSatisfy(isLimit);
+        expect(
+            await redis.smembers(`ev:s:{${holder}}:${overflow.socketId}`),
+        ).not.toContain(`${USER}|${overflow.token}|${overflow.subId}`);
+
+        // The owner's own rows don't count, and another handle has its own room.
+        await expect(store.add(through(USER, 10))).resolves.toMatchObject({
+            userId: USER,
+        });
+        await expect(
+            store.add(
+                through(holder, cap + 1, { subject: `kv:${OTHER_HANDLE}:*` }),
+            ),
+        ).resolves.toMatchObject({ userId: USER });
+
+        await store.remove(through(holder, 0));
+        await expect(
+            store.add(through(holder, cap + 2)),
+        ).resolves.toMatchObject({ userId: USER });
+        // Fills the whole cap one add at a time, which a loaded runner takes
+        // past the default timeout.
+    }, 30_000);
+
+    it('lists the rows made through the given handles, and no others', async () => {
+        const holder = USER + 7000;
+        const held = through(holder, 0);
+        const own = through(USER, 1);
+        await store.add(held);
+        await store.add(own);
+        await store.add(
+            through(holder, 2, { subject: `kv:${OTHER_HANDLE}:*` }),
+        );
+        await store.add(makeSub({ subId: 'plain', subject: 'kv:ws:*' }));
+
+        const listed = await store.listForKvHandles(USER, [HANDLE]);
+        expect(listed.map((row) => row.subId).sort()).toEqual(
+            [held.subId, own.subId].sort(),
+        );
+        // Nothing is indexed under a user who owns none of it.
+        await expect(store.listForKvHandles(holder, [HANDLE])).resolves.toEqual(
+            [],
+        );
+
+        await store.remove(held);
+        await expect(store.listForKvHandles(USER, [HANDLE])).resolves.toEqual([
+            own,
+        ]);
+    });
+
+    it('lets go of rows whose handle no longer stands on refresh, and keeps the rest', async () => {
+        const holder = USER + 7000;
+        const viaHandle = through(holder, 0, { socketId: 'socket-a' });
+        const own = sharedWith(holder, { subId: 'folder', token: 'f#shared' });
+        await store.add(viaHandle);
+        await store.add(own);
+
+        const asked: string[] = [];
+        const { reasserted, lapsed } = await store.refresh(holder, 'socket-a', {
+            stillHeld: async (row) => {
+                asked.push(row.subId);
+                return false;
+            },
+        });
+
+        // Only rows made through a handle are asked about.
+        expect(asked).toEqual([viaHandle.subId]);
+        expect(lapsed).toEqual([viaHandle]);
+        expect(reasserted).toEqual([{ ownerUserId: USER, token: 'f#shared' }]);
+    });
+
+    it('renews the handle index with the rows that still stand', async () => {
+        const holder = USER + 7000;
+        const row = through(holder, 0, { socketId: 'socket-a' });
+        await store.add(row);
+        await redis.del(`ev:kh:{${USER}}:${HANDLE}`);
+
+        await store.refresh(holder, 'socket-a', {
+            stillHeld: async () => true,
+        });
+
+        await expect(store.listForKvHandles(USER, [HANDLE])).resolves.toEqual([
+            row,
+        ]);
+        expect(await redis.ttl(`ev:kh:{${USER}}:${HANDLE}`)).toBeGreaterThan(
+            SESSION_SUBSCRIPTION_TTL_SECONDS - 10,
+        );
+    });
+
+    it('asks about each handle once per holder and app on refresh', async () => {
+        const holder = USER + 7000;
+        const rows = [
+            through(holder, 0, { socketId: 'socket-a' }),
+            through(holder, 1, {
+                socketId: 'socket-a',
+                token: 'k#owner#app#ws:a:',
+            }),
+            through(holder, 2, {
+                socketId: 'socket-a',
+                token: 'k#owner#app#ws:b:',
+            }),
+            through(holder, 3, { socketId: 'socket-a', appUid: 'app-x' }),
+            through(holder, 4, {
+                socketId: 'socket-a',
+                subject: `kv:${OTHER_HANDLE}:*`,
+            }),
+        ];
+        for (const row of rows) await store.add(row);
+
+        const stillHeld = vi.fn(async (row: SessionSubscription) =>
+            row.subject.includes(HANDLE),
+        );
+        const { lapsed } = await store.refresh(holder, 'socket-a', {
+            stillHeld,
+        });
+
+        expect(stillHeld).toHaveBeenCalledTimes(3);
+        expect(lapsed).toEqual([rows[4]]);
     });
 });
 
@@ -567,6 +764,50 @@ describe('reanchor', () => {
     });
 });
 
+describe('a key with `|` in it', () => {
+    // The socket ref is `owner|token|subId`, and a KV token carries the key.
+    const piped = (over: Partial<SessionSubscription> = {}) =>
+        makeSub({
+            subject: 'kv:app:a|b:*',
+            token: 'k#owner#app#a|b:',
+            anchorUid: 'app',
+            anchorPath: 'a|b:',
+            ...over,
+        });
+
+    it('can be unsubscribed', async () => {
+        const sub = piped();
+        await store.add(sub);
+
+        const held = await store.getForSocket(USER, 'socket-a', sub.subId);
+        expect(held).toEqual(sub);
+        await expect(store.remove(held!)).resolves.toMatchObject({
+            userId: USER,
+        });
+        await expect(store.getForTokens(USER, [sub.token])).resolves.toEqual(
+            [],
+        );
+        await expect(store.watchedTokens(USER, [sub.token])).resolves.toEqual(
+            [],
+        );
+    });
+
+    it('is reaped with its connection', async () => {
+        const sub = piped();
+        await store.add(sub);
+        await expect(store.listForSocket(USER, 'socket-a')).resolves.toEqual([
+            sub,
+        ]);
+
+        await store.reapSocket(USER, 'socket-a');
+
+        await expect(store.getForTokens(USER, [sub.token])).resolves.toEqual(
+            [],
+        );
+        await expect(store.userHasAny(USER)).resolves.toBe(false);
+    });
+});
+
 describe('disconnect', () => {
     it('leaves no key behind for the socket that went', async () => {
         await store.add(makeSub({ subId: 'a', token: 'f#one' }));
@@ -661,7 +902,6 @@ describe('durable rows sharing a session key', () => {
             socketId: undefined,
             durable: true,
             delivery: 'broadcast',
-            targets: ['socket'],
             handlerName: null,
             context: null,
             expiresAt: null,
@@ -840,11 +1080,11 @@ describe('rows asking for kv values', () => {
         await store.add(asking());
         await store.add(makeSub({ socketId: 'socket-b' }));
 
-        expect(await store.refresh(USER, 'socket-a')).toEqual([
+        expect((await store.refresh(USER, 'socket-a')).reasserted).toEqual([
             { ownerUserId: USER, token: 'f#anchor' },
             { ownerUserId: USER, token: VALUE },
         ]);
-        expect(await store.refresh(USER, 'socket-b')).toEqual([
+        expect((await store.refresh(USER, 'socket-b')).reasserted).toEqual([
             { ownerUserId: USER, token: 'f#anchor' },
         ]);
     });
@@ -876,7 +1116,6 @@ describe('reading rows for dispatch', () => {
                     socketId: undefined,
                     durable: true,
                     delivery: 'broadcast',
-                    targets: ['socket'],
                     handlerName: null,
                     context: null,
                     expiresAt: null,
@@ -1022,5 +1261,30 @@ describe('the generation counter', () => {
         expect(await redis.ttl(`ev:g:{${USER}}`)).toBeGreaterThan(
             SESSION_SUBSCRIPTION_TTL_SECONDS,
         );
+    });
+});
+
+describe('dropping an owner', () => {
+    it("removes every key kept for the owner and leaves other owners' alone", async () => {
+        const other = USER + 5000;
+        await store.add(makeSub({ subId: 'a' }));
+        await store.add(makeSub({ subId: 'b', token: 'f#two' }));
+        await store.cacheDurable([
+            makeSub({
+                subId: 'd',
+                token: 'f#durable',
+            }) as unknown as DurableSubscription,
+        ]);
+        await store.markRegionWarm(USER);
+        await store.add(
+            makeSub({ subId: 'c', holderUserId: other, ownerUserId: other }),
+        );
+
+        await store.dropOwner(USER);
+
+        // Socket sets are the holder's, named by socket, and expire on their own.
+        const left = await redis.keys(`ev:*:{${USER}}*`);
+        expect(left.filter((key) => !key.startsWith('ev:s:'))).toEqual([]);
+        await expect(store.userHasAny(other)).resolves.toBe(true);
     });
 });

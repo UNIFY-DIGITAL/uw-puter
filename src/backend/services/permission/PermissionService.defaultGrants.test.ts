@@ -143,6 +143,9 @@ describe('check on default grants', () => {
         'events:background',
         'events:background:extra',
         'events',
+        'notifications:push',
+        'notifications:push:extra',
+        'notifications',
         'driver:puter-kvstore',
         'driver:puter-kvstore:get',
         'driver:puter-chat-completion:complete',
@@ -195,7 +198,13 @@ describe('check on default grants', () => {
     it('answers a default grant without reading the scan cache', async () => {
         const getScanCache = vi.spyOn(server.stores.permission, 'getScanCache');
         try {
-            for (const actor of [actors.user, actors.looseUser, actors.app]) {
+            // A full-access token holds its issuer's defaults.
+            for (const actor of [
+                actors.user,
+                actors.looseUser,
+                actors.app,
+                actors.fullToken,
+            ]) {
                 expect(
                     await permService.check(
                         actor,
@@ -211,10 +220,7 @@ describe('check on default grants', () => {
                     actors.scopedToken,
                     'service:puter-chat-completion:ii:puter-chat-completion',
                 ],
-                [
-                    actors.fullToken,
-                    'service:puter-chat-completion:ii:puter-chat-completion',
-                ],
+                [actors.fullToken, `fs:${fileUid}:read`],
                 [actors.app, 'feature:something'],
                 [actors.user, `fs:${fileUid}:read`],
             ] as const) {

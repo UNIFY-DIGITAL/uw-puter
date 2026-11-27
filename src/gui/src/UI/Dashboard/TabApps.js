@@ -426,6 +426,10 @@ function showUninstallModal ({ appName, appTitle, appUid, self, $el_window }) {
             <div class="myapps-modal" role="dialog" aria-modal="true" aria-label="${i18n('uninstall_app', { name: displayName })}">
                 <h3>${i18n('uninstall_app', { name: displayName })}</h3>
                 <p>${i18n('uninstall_app_body')}</p>
+                <label class="myapps-modal-option">
+                    <input type="checkbox" class="myapps-modal-delete-data">
+                    <span>${i18n('uninstall_delete_data')}</span>
+                </label>
                 <div class="myapps-modal-buttons">
                     <button class="myapps-modal-btn myapps-modal-cancel">${i18n('cancel')}</button>
                     <button class="myapps-modal-btn myapps-modal-confirm">${i18n('uninstall')}</button>
@@ -470,6 +474,7 @@ function showUninstallModal ({ appName, appTitle, appUid, self, $el_window }) {
         // The saved order intentionally keeps the app's name:
         // reconcileAppOrder ignores it while the app is gone and
         // restores its position if it comes back.
+        const deleteData = $overlay.find('.myapps-modal-delete-data').is(':checked');
         const removedIndex = self._apps.findIndex(a => a.name === appName);
         const removedApp = removedIndex === -1 ? null : self._apps[removedIndex];
         // A running instance would be stranded: the tile is a headless
@@ -558,7 +563,7 @@ function showUninstallModal ({ appName, appTitle, appUid, self, $el_window }) {
             finishRemoval();
         }
 
-        puter.perms.revokeApp(appUid, '*').then(async (result) => {
+        puter.perms.revokeApp(appUid, '*', { deleteData }).then(async (result) => {
             // revokeApp resolves (never rejects) with `error` set on failure.
             if ( result?.error ) throw result;
             // Clearing the grants is only half of it. An app the user already
@@ -918,6 +923,8 @@ const TabApps = {
     _justDragged: false,
     _reduceMotionMQL: undefined,
     _loadPromise: null,
+    // Set by init: the open's first load joins Home's /get-launch-apps.
+    _joinHomeLaunchApps: false,
     _pendingLoad: null,
     _savedOrderNames: null,
     _orderSavedAtSeq: 0,
@@ -977,6 +984,7 @@ const TabApps = {
         // contrast, is data and survives re-init).
         this._arriving = null;
 
+        this._joinHomeLaunchApps = true;
         this.loadApps($el_window);
 
         const self = this;
@@ -3279,6 +3287,34 @@ const TabApps = {
         return p;
     },
 
+    // Only `recommended` is used here. At dashboard open this rides Home's
+    // in-flight request; later refetches ask the server to skip `recent`.
+    async _fetchLaunchApps () {
+        const homeRequest = this._joinHomeLaunchApps ? window.launch_apps_request : null;
+        this._joinHomeLaunchApps = false;
+        if ( homeRequest ) {
+            try {
+                const launchData = await homeRequest;
+                if ( launchData ) return launchData;
+            } catch {
+                // Home reports its own failure; fetch ours below.
+            }
+        }
+        try {
+            const res = await fetch(
+                `${window.api_origin}/get-launch-apps?icon_size=128&recent=0`,
+                {
+                    headers: { 'Authorization': `Bearer ${window.auth_token}` },
+                    method: 'GET',
+                },
+            );
+            return res.ok ? await res.json() : null;
+        } catch ( err ) {
+            console.error('Failed to fetch launch apps:', err);
+            return null;
+        }
+    },
+
     async _fetchAndRenderApps ($el_window) {
         // Give each load a monotonically increasing id. An older/slower
         // response must not clobber a newer one that already applied — or a
@@ -3339,16 +3375,7 @@ const TabApps = {
                 // The recommended list only adds tiles: if it fails (network,
                 // a proxy's HTML error page), the installed apps still show,
                 // with the last list that did load. null marks the failure.
-                fetch(
-                    `${window.api_origin}/get-launch-apps?icon_size=128`,
-                    {
-                        headers: { 'Authorization': `Bearer ${window.auth_token}` },
-                        method: 'GET',
-                    },
-                ).then(res => res.ok ? res.json() : null).catch(err => {
-                    console.error('Failed to fetch launch apps:', err);
-                    return null;
-                }),
+                this._fetchLaunchApps(),
                 puter.kv.get(APPS_ORDER_KV_KEY).catch(() => KV_READ_FAILED),
                 puter.kv.get(REMOVED_APPS_KV_KEY).catch(() => KV_READ_FAILED),
                 puter.kv.get(APP_GROUPS_KV_KEY).catch(() => KV_READ_FAILED),

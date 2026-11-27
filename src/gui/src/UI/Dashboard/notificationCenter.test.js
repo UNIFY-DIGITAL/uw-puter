@@ -21,6 +21,8 @@ import { describe, it, expect } from 'vitest';
 import {
     badgeLabel,
     glyphKey,
+    httpsIconFor,
+    isAppOnlyNotification,
     isShareNotification,
     isUnread,
     listedEntries,
@@ -29,8 +31,10 @@ import {
     parseCreatedAt,
     planBurstToasts,
     reconcileWithServer,
+    senderNameFor,
     setReadAt,
     sortEntries,
+    takeMarksSince,
     titleWithBadge,
     toEntry,
     unreadCount,
@@ -91,6 +95,11 @@ describe('toEntry', () => {
         });
     });
 
+    it('keeps the app a row names, from a driver row or a feed item', () => {
+        expect(toEntry({ uid: 'a', value: {}, app_uid: 'app-1' }, NOW).appUid).toBe('app-1');
+        expect(toEntry({ uid: 'a', value: {} }, NOW)).not.toHaveProperty('appUid');
+    });
+
     it('reads when a row was acknowledged, in epoch seconds', () => {
         const readAt = NOW - 5 * MIN;
         const out = toEntry({ uid: 'a', value: {}, created_at: null, acknowledged: readAt / 1000 }, NOW);
@@ -114,6 +123,16 @@ describe('toEntry', () => {
     it('tolerates a missing or malformed payload', () => {
         expect(toEntry({ uid: 'a' }, NOW).notification).toEqual({});
         expect(toEntry({ uid: 'a', value: 'text' }, NOW).notification).toEqual({});
+    });
+
+    it("leaves out an app's own message, live or listed, and keeps shares", () => {
+        const message = { type: 'app.message', title: 'Hi', app: { uid: 'app-1' } };
+        expect(isAppOnlyNotification(message)).toBe(true);
+        expect(toEntry({ uid: 'a', value: message, app_uid: 'app-1' }, NOW)).toBeNull();
+        expect(toEntry({ uid: 'a', notification: message }, NOW)).toBeNull();
+        expect(unreadCount(listedEntries([{ uid: 'a', value: message }], NOW, 10))).toBe(0);
+        expect(isAppOnlyNotification({ type: 'share.received' })).toBe(false);
+        expect(toEntry({ uid: 'b', value: { type: 'share.received' } }, NOW)).not.toBeNull();
     });
 
     it('rejects anything without a uid', () => {
@@ -277,6 +296,19 @@ describe('setReadAt', () => {
     });
 });
 
+describe('takeMarksSince', () => {
+    it('returns what finished at or after the request, or is still out', () => {
+        const marks = new Map([['before', NOW - 1], ['at', NOW], ['after', NOW + 1], ['out', Infinity]]);
+        expect(takeMarksSince(marks, NOW)).toEqual(new Set(['at', 'after', 'out']));
+    });
+
+    it('forgets what finished before the request', () => {
+        const marks = new Map([['before', NOW - 1], ['out', Infinity]]);
+        takeMarksSince(marks, NOW);
+        expect([...marks.keys()]).toEqual(['out']);
+    });
+});
+
 describe('unreadCount', () => {
     it('counts only what has no read time', () => {
         expect(unreadCount([entry('a', NOW), entry('b', NOW, { readAt: NOW }), entry('c', NOW)])).toBe(2);
@@ -430,5 +462,36 @@ describe('planBurstToasts', () => {
         const { shown, folded } = planBurstToasts(many(12));
         expect(shown.map((e) => e.uid)).toEqual(['n0', 'n1', 'n2']);
         expect(folded).toBe(9);
+    });
+});
+
+describe('senderNameFor', () => {
+    it('names the sending app of an app message', () => {
+        expect(senderNameFor({ type: 'app.message', title: 'Hi', app: { uid: 'app-1', name: 'Chat' } }))
+            .toBe('Chat');
+    });
+
+    it('names nobody for other types, or an app message with no name', () => {
+        expect(senderNameFor({ type: 'share.received', app: { name: 'Chat' } })).toBeNull();
+        expect(senderNameFor({ type: 'app.message', app: { uid: 'app-1' } })).toBeNull();
+        expect(senderNameFor({ type: 'app.message', app: { name: '  ' } })).toBeNull();
+        expect(senderNameFor(undefined)).toBeNull();
+    });
+});
+
+describe('httpsIconFor', () => {
+    it("takes the notification's https icon, else its app's", () => {
+        expect(httpsIconFor({ icon: 'https://example.com/a.png' })).toBe('https://example.com/a.png');
+        expect(httpsIconFor({ icon: 'bell.svg', app: { icon: 'https://example.com/app.png' } }))
+            .toBe('https://example.com/app.png');
+    });
+
+    it('is nothing for an icon name, another scheme, or no icon', () => {
+        expect(httpsIconFor({ icon: 'shared.svg' })).toBeNull();
+        expect(httpsIconFor({ icon: 'http://example.com/a.png' })).toBeNull();
+        expect(httpsIconFor({ icon: 'data:image/png;base64,AAAA' })).toBeNull();
+        expect(httpsIconFor({ icon: 'ftp://example.com/a.png' })).toBeNull();
+        expect(httpsIconFor({})).toBeNull();
+        expect(httpsIconFor(undefined)).toBeNull();
     });
 });

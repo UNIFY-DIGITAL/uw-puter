@@ -19,6 +19,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { escapeLike } from '../../util/sqlLike';
+import { isTrashedPath } from '../../util/hostedAppBacking';
 import { runWithConcurrencyLimit } from '../../util/concurrency';
 import { CACHE_TOMBSTONE_TTL_SECONDS, PuterStore } from '../types';
 
@@ -48,7 +49,7 @@ export interface SubdomainRow {
 /** A row deleted by the database along with an app. */
 export type CascadeRow = Pick<
     SubdomainRow,
-    'uuid' | 'subdomain' | 'root_dir_id'
+    'uuid' | 'subdomain' | 'root_dir_id' | 'user_id'
 >;
 
 // Columns that may not be set through an `update` patch map. Defence-in-depth
@@ -63,7 +64,8 @@ export type CascadeRow = Pick<
 //   - name / identity: `subdomain` — v1 marks this `immutable: true`; rename
 //     would orphan DNS + ACL wiring tied to the old name.
 //   - ownership: `user_id`, `app_owner` — set via `create` (or reclaimed in
-//     place by `reclaimByUuid`), never via patch.
+//     place by `reclaimByUuid`, or a worker rebound by `setAppOwner`), never
+//     via patch.
 //     Flipping either hands the site to another user / app.
 //   - access gate: `protected` — clearing this lets a future caller delete
 //     or rename a protected site (e.g. `puter-app-icons`). The driver itself
@@ -155,10 +157,16 @@ export class SubdomainStore extends PuterStore {
      * which may hold a stale negative marker — and reads the primary instead of
      * a possibly-lagging replica. The result still refreshes the cache, healing
      * any stale marker.
+     *
+     * `cachedMisses` collects the name when the null came from a negative cache
+     * entry rather than a database read.
      */
     async getBySubdomain(
         subdomain: string,
-        { primary = false }: { primary?: boolean } = {},
+        {
+            primary = false,
+            cachedMisses,
+        }: { primary?: boolean; cachedMisses?: Set<string> } = {},
     ): Promise<SubdomainRow | null> {
         if (!subdomain) return null;
 
@@ -166,7 +174,10 @@ export class SubdomainStore extends PuterStore {
         if (!primary) {
             try {
                 const raw = await this.clients.redis.get(cacheKey);
-                if (raw === NEGATIVE_CACHE_MARKER) return null;
+                if (raw === NEGATIVE_CACHE_MARKER) {
+                    cachedMisses?.add(subdomain);
+                    return null;
+                }
                 if (raw) {
                     const parsed = JSON.parse(raw) as SubdomainRow | null;
                     if (parsed) return parsed;
@@ -205,11 +216,15 @@ export class SubdomainStore extends PuterStore {
      * Batched sibling of {@link getBySubdomain} — one cache pipeline plus one
      * chunked `IN (…)` query for the misses, instead of one lookup per name.
      * Keyed by the requested names; a name with no row (negative-cached or
-     * genuinely absent) is simply missing from the returned map.
+     * genuinely absent) is simply missing from the returned map. `cachedMisses`
+     * collects the names that were negative-cached.
      */
     async getBySubdomains(
         names: string[],
-        { primary = false }: { primary?: boolean } = {},
+        {
+            primary = false,
+            cachedMisses,
+        }: { primary?: boolean; cachedMisses?: Set<string> } = {},
     ): Promise<Map<string, SubdomainRow>> {
         const result = new Map<string, SubdomainRow>();
         const uniqueNames = [
@@ -233,7 +248,10 @@ export class SubdomainStore extends PuterStore {
                 for (let i = 0; i < uniqueNames.length; i++) {
                     const name = uniqueNames[i]!;
                     const raw = cacheResults[i]?.[1];
-                    if (raw === NEGATIVE_CACHE_MARKER) continue; // cached miss
+                    if (raw === NEGATIVE_CACHE_MARKER) {
+                        cachedMisses?.add(name);
+                        continue;
+                    }
                     if (typeof raw === 'string') {
                         try {
                             const parsed = JSON.parse(
@@ -322,6 +340,23 @@ export class SubdomainStore extends PuterStore {
             }
         }
         return rowsByName;
+    }
+
+    /**
+     * Which of `rootDirIds` sit in their owner's Trash, where sites don't
+     * serve.
+     */
+    async trashedRootDirIds(rootDirIds: number[]): Promise<Set<number>> {
+        const trashed = new Set<number>();
+        const fsEntry = this.stores?.fsEntry;
+        if (rootDirIds.length === 0 || !fsEntry?.getEntriesByIds) {
+            return trashed;
+        }
+        const entries = await fsEntry.getEntriesByIds(rootDirIds);
+        for (const [id, entry] of entries) {
+            if (entry?.path && isTrashedPath(entry.path)) trashed.add(id);
+        }
+        return trashed;
     }
 
     async listByUserId(
@@ -599,7 +634,9 @@ export class SubdomainStore extends PuterStore {
             preamble_version: preambleVersion,
             protected: isProtected ? 1 : 0,
         };
-        await this.#refreshCache(row);
+        // Tombstoned so a peer whose replica lacks the row yet can't cache a
+        // negative marker for the new name.
+        await this.#publishChanged([row as unknown as SubdomainRow]);
         await this.#invalidateRootDirEntry(row.root_dir_id);
 
         return row;
@@ -734,6 +771,25 @@ export class SubdomainStore extends PuterStore {
     }
 
     /**
+     * Bind one of `userId`'s rows to another app, or to none: a worker
+     * redeployed under a different app. The caller has already authorized that
+     * binding, which a patch through `update` never could.
+     */
+    async setAppOwner(
+        uuid: string,
+        appOwner: number | null,
+        { userId }: { userId: number },
+    ): Promise<SubdomainRow | null> {
+        await this.clients.db.write(
+            'UPDATE `subdomains` SET `app_owner` = ? WHERE `uuid` = ? AND `user_id` = ?',
+            [appOwner, uuid, userId],
+        );
+        const after = await this.getByUuid(uuid, { userId, primary: true });
+        await this.#publishChanged(after ? [after] : []);
+        return after;
+    }
+
+    /**
      * Hand every row `fromAppId` owns to `toAppId`. For merging one app row
      * into another: `app_owner` cascades on app delete, so the rows have to
      * change hands before the source app row goes. Returns the moved rows.
@@ -777,13 +833,13 @@ export class SubdomainStore extends PuterStore {
         let afterId = 0;
         for (;;) {
             const rows = (await this.clients.db.pread(
-                `SELECT \`id\`, \`uuid\`, \`subdomain\`, \`root_dir_id\` FROM \`subdomains\`
+                `SELECT \`id\`, \`uuid\`, \`subdomain\`, \`root_dir_id\`, \`user_id\` FROM \`subdomains\`
                   WHERE (\`app_owner\` ${match} OR \`associated_app_id\` ${match})
                     AND \`id\` > ? ORDER BY \`id\` LIMIT ?`,
                 [param, param, afterId, BULK_QUERY_CHUNK_SIZE],
             )) as Array<Pick<SubdomainRow, 'id'> & CascadeRow>;
-            for (const { uuid, subdomain, root_dir_id } of rows) {
-                out.push({ uuid, subdomain, root_dir_id });
+            for (const { uuid, subdomain, root_dir_id, user_id } of rows) {
+                out.push({ uuid, subdomain, root_dir_id, user_id });
             }
             if (rows.length < BULK_QUERY_CHUNK_SIZE) return out;
             afterId = Number(rows[rows.length - 1].id);
@@ -813,7 +869,11 @@ export class SubdomainStore extends PuterStore {
             try {
                 this.clients.event.emit(
                     'subdomain.delete',
-                    { subdomain: row.subdomain, uid: String(row.uuid) },
+                    {
+                        subdomain: row.subdomain,
+                        uid: String(row.uuid),
+                        userId: Number(row.user_id),
+                    },
                     {},
                 );
             } catch {
@@ -922,16 +982,6 @@ export class SubdomainStore extends PuterStore {
         } catch {
             // The next read fills it from the primary.
         }
-    }
-
-    async #refreshCache(row: { subdomain?: string }) {
-        if (!row?.subdomain) return;
-        await this.publishCacheKeys({
-            keys: [this.#cacheKey(row.subdomain)],
-            serializedData: JSON.stringify(row),
-            ttlSeconds: CACHE_TTL_SECONDS,
-            broadcast: true,
-        });
     }
 
     // FSEntryStore caches each row with an embedded `subdomains_agg` JSON

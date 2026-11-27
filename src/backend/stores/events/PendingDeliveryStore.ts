@@ -23,6 +23,8 @@ import {
     EVENTS_FAILURE_COUNTER_TTL_MS,
     EVENTS_PENDING_DELIVERIES_PER_SUBSCRIPTION,
     EVENTS_REGION_PENDING_CEILING,
+    EVENTS_RETRY_MAX_MS,
+    EVENTS_SOCKET_LEASE_MS,
     deliveryBackoffMs,
 } from '../../controllers/events/limits.js';
 import type {
@@ -157,6 +159,19 @@ end
 return head[2]
 `;
 
+/**
+ * Move one lease, only if it is still there and, when `expected` is given,
+ * still the lease that was handed out. KEYS: lease. ARGV: entryId, expected
+ * (empty for any), leaseUntil. Returns 1 when moved.
+ */
+const RELEASE_SCRIPT = `
+local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not current then return 0 end
+if ARGV[2] ~= '' and tonumber(current) ~= tonumber(ARGV[2]) then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+return 1
+`;
+
 interface PendingScripts {
     pendingClaim(
         entries: string,
@@ -172,6 +187,12 @@ interface PendingScripts {
         lease: string,
         hold: string,
     ): Promise<string>;
+    pendingRelease(
+        lease: string,
+        entryId: string,
+        expected: string,
+        leaseUntil: string,
+    ): Promise<number>;
 }
 
 // -- Shapes -----------------------------------------------------------
@@ -220,6 +241,8 @@ interface StoredEntry {
     billed?: boolean;
     /** Absent for an event no handler produced. */
     handlerDepth?: number;
+    /** When the socket lease it was last handed out under expires. */
+    socketLeaseUntil?: number;
 }
 
 const parseEntry = (raw: string | null): StoredEntry | null => {
@@ -274,15 +297,18 @@ export class PendingDeliveryStore extends PuterStore {
                 numberOfKeys: 4,
                 lua: REINDEX_SCRIPT,
             });
+            this.clients.redis.defineCommand('pendingRelease', {
+                numberOfKeys: 1,
+                lua: RELEASE_SCRIPT,
+            });
         }
         return this.clients.redis as unknown as PendingScripts;
     }
 
     /**
-     * Long enough for a handler doing real work — twice the invoke timeout the
-     * invoker resolves the same way, so a slow but successful run is never
-     * re-invoked mid-flight — and short enough that a tab that closed
-     * mid-delivery does not hold the queue.
+     * The worker lease: twice the invoke timeout the invoker resolves the same
+     * way, so a slow but successful run is never re-invoked mid-flight. A
+     * client gets the shorter socket lease instead (`leaseToSocket`).
      */
     #leaseTtlMs(): number {
         const configured = this.config.events?.invokeTimeoutMs;
@@ -379,20 +405,64 @@ export class PendingDeliveryStore extends PuterStore {
         await this.clients.redis.zadd(INDEX_KEY, 'XX', Date.now(), subId);
     }
 
-    /** Count one socket attempt against a claimed delivery. */
-    async recordSocketAttempt(subId: string, entryId: string): Promise<number> {
+    /**
+     * Hand a claimed delivery to a connected client: count the attempt and
+     * shorten its lease to the socket lease. The expiry is stamped on the
+     * entry, which is how a decline later proves the lease is still the
+     * client's.
+     */
+    async leaseToSocket(subId: string, entryId: string): Promise<void> {
         const entry = parseEntry(
             await this.clients.redis.hget(entriesKey(subId), entryId),
         );
-        if (!entry) return 0;
+        if (!entry) return;
 
-        const socketAttempts = entry.socketAttempts + 1;
+        const socketLeaseUntil = Date.now() + EVENTS_SOCKET_LEASE_MS;
         await this.clients.redis.hset(
             entriesKey(subId),
             entryId,
-            JSON.stringify({ ...entry, socketAttempts }),
+            JSON.stringify({
+                ...entry,
+                socketAttempts: entry.socketAttempts + 1,
+                socketLeaseUntil,
+            }),
         );
-        return socketAttempts;
+        await this.#scripts().pendingRelease(
+            leaseKey(subId),
+            entryId,
+            '',
+            String(socketLeaseUntil),
+        );
+    }
+
+    /**
+     * Take back a delivery a client declined, under a worker lease. Null when
+     * the client's lease is no longer the one in place: settled, lapsed and
+     * claimed again, or already declined.
+     */
+    async takeFromSocket(
+        subId: string,
+        entryId: string,
+    ): Promise<ClaimedDelivery | null> {
+        const entry = parseEntry(
+            await this.clients.redis.hget(entriesKey(subId), entryId),
+        );
+        if (!entry?.socketLeaseUntil) return null;
+
+        const moved = await this.#scripts().pendingRelease(
+            leaseKey(subId),
+            entryId,
+            String(entry.socketLeaseUntil),
+            String(Date.now() + this.#leaseTtlMs()),
+        );
+        if (Number(moved) !== 1) return null;
+        return {
+            entryId,
+            event: entry.event,
+            socketAttempts: entry.socketAttempts,
+            triedRegions: entry.triedRegions ?? [],
+            handlerDepth: entry.handlerDepth ?? 0,
+        };
     }
 
     /**
@@ -441,17 +511,22 @@ export class PendingDeliveryStore extends PuterStore {
      * Count one failed handler attempt and hold the delivery until its wait is
      * over. The lease is the hold: a score in the future is what `claim` reads
      * as "in flight", so pushing it out paces the retry with no second
-     * mechanism to keep in step.
+     * mechanism to keep in step. `minWaitMs` stretches the wait up to the
+     * backoff ceiling, for an answer that said how long to stay away.
      */
     async deferAfterFailure(
         subId: string,
         entryId: string,
+        minWaitMs = 0,
     ): Promise<DeferredDelivery> {
         const entry = parseEntry(
             await this.clients.redis.hget(entriesKey(subId), entryId),
         );
         const attempts = (entry?.handlerAttempts ?? 0) + 1;
-        const retryInMs = deliveryBackoffMs(attempts);
+        const retryInMs = Math.max(
+            deliveryBackoffMs(attempts),
+            Math.min(minWaitMs, EVENTS_RETRY_MAX_MS),
+        );
 
         const write = this.clients.redis.pipeline();
         if (entry)
@@ -659,6 +734,19 @@ export class PendingDeliveryStore extends PuterStore {
 
     async depth(subId: string): Promise<number> {
         return Number(await this.clients.redis.zcard(pendingKey(subId))) || 0;
+    }
+
+    /**
+     * Whether one of this subscription's deliveries is leased: in flight, or
+     * waiting out a retry. Nothing of its can be claimed until that lapses.
+     */
+    async inFlight(subId: string): Promise<boolean> {
+        const leased = await this.clients.redis.zcount(
+            leaseKey(subId),
+            Date.now(),
+            '+inf',
+        );
+        return Number(leased) > 0;
     }
 
     /** What the region is holding in total, and what its ceiling is read from. */

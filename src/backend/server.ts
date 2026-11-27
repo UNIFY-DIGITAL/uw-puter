@@ -29,12 +29,17 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import http from 'node:http';
+import { isIP } from 'node:net';
 import { puterClients } from './clients';
 import { puterControllers } from './controllers';
 import { createAuthProbe } from './core/http/middleware/authProbe';
 import { createRequestContextMiddleware } from './core/http/middleware/requestContext';
 import { createFingerprintMiddleware } from './core/http/middleware/fingerprint';
 import { createErrorHandler } from './core/http/middleware/errorHandler';
+import {
+    createLargeJsonBodyParser,
+    DEFAULT_JSON_LIMIT_BYTES,
+} from './core/http/middleware/largeJsonBody';
 import { actorUid, type Actor } from './core/actor';
 import { isHttpError } from './core/http/HttpError';
 import {
@@ -116,12 +121,40 @@ import type {
     IConfig,
     LayerInstances,
     PagerSeverity,
+    ServerDrainInfo,
     WithControllerRegistration,
     WithLifecycle,
 } from './types';
 
 /** Idle keep-alive timeout used when `keep_alive_timeout` is unset. */
 const DEFAULT_KEEP_ALIVE_TIMEOUT = 920_000;
+
+/**
+ * AI request routes, which take bodies up to the size Claude's Messages API
+ * accepts from a signed-in caller. puter.ai.chat goes through `/drivers/call`.
+ */
+const LARGE_JSON_ROUTES = [
+    '/drivers/call',
+    '/puterai/openai/v1/chat/completions',
+    '/puterai/openai/v1/completions',
+    '/puterai/openai/v1/responses',
+    '/puterai/anthropic/v1/messages',
+    '/puterai/anthropic/v1/messages/count_tokens',
+];
+const LARGE_JSON_LIMIT_BYTES = 128 * 1024 * 1024;
+/** Two max-size bodies per process. */
+const LARGE_JSON_BUDGET_BYTES = 2 * LARGE_JSON_LIMIT_BYTES;
+
+/**
+ * Through `/drivers/call`, only chat takes a large body; other drivers keep the
+ * default limit. Keyed on the body rather than the path, which routing matches
+ * loosely (case, trailing slash). Wire API bodies carry no `interface`.
+ */
+const acceptsLargeJson = (req: Request): boolean => {
+    const iface = (req.body as { interface?: unknown } | null | undefined)
+        ?.interface;
+    return iface === undefined || iface === 'puter-chat-completion';
+};
 
 /** Route options a claimed subdomain's routes may use. */
 const CLAIMED_ROUTE_OPTIONS = new Set([
@@ -523,10 +556,34 @@ export class PuterServer {
             // body-parser hands over a fresh buffer and never writes to it.
             (req as { rawBody?: Buffer }).rawBody = buf;
         };
-        this.#app.use(express.json({ limit: '50mb', verify: captureRawBody }));
+        const authService = this.services.auth as AuthService | undefined;
+        const authProbe = authService
+            ? createAuthProbe({
+                  authService,
+                  cookieName: this.#config.cookie_name,
+              })
+            : undefined;
+        if (authProbe) {
+            this.#app.post(
+                LARGE_JSON_ROUTES,
+                createLargeJsonBodyParser({
+                    authProbe,
+                    limitBytes: LARGE_JSON_LIMIT_BYTES,
+                    budgetBytes: LARGE_JSON_BUDGET_BYTES,
+                    perUserBytes: LARGE_JSON_LIMIT_BYTES,
+                    accepts: acceptsLargeJson,
+                }),
+            );
+        }
         this.#app.use(
             express.json({
-                limit: '50mb',
+                limit: DEFAULT_JSON_LIMIT_BYTES,
+                verify: captureRawBody,
+            }),
+        );
+        this.#app.use(
+            express.json({
+                limit: DEFAULT_JSON_LIMIT_BYTES,
                 type: (req) =>
                     req.headers['content-type'] === 'text/plain;actually=json',
                 verify: captureRawBody,
@@ -540,14 +597,8 @@ export class PuterServer {
         this.#app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
         // -- Auth probe ----------------------------------------------
-        const authService = this.services.auth as AuthService | undefined;
-        if (authService) {
-            this.#app.use(
-                createAuthProbe({
-                    authService,
-                    cookieName: this.#config.cookie_name,
-                }),
-            );
+        if (authProbe) {
+            this.#app.use(authProbe);
         }
 
         // -- Request fingerprints ------------------------------------
@@ -597,7 +648,32 @@ export class PuterServer {
 
         // Build the allowed-domain set from config.
         this.#app.use((req, res, next) => {
+            const hostName = (req.headers.host ?? '')
+                .split(':')[0]
+                .trim()
+                .toLowerCase();
+            const isOwnHost =
+                !hostName ||
+                this.#getAllowedDomains().some((d) =>
+                    PuterServer.#hostMatchesDomain(hostName, d),
+                );
+
+            // Accepting every host still has to tell custom domains apart, or
+            // they fall through to the API/GUI instead of site hosting. An IP
+            // or localhost is never one: load balancer health checks and
+            // in-cluster callers address the server that way.
             if (config.allow_all_host_values) {
+                if (
+                    config.custom_domains_enabled &&
+                    !isOwnHost &&
+                    req.path !== '/healthcheck' &&
+                    // `[` is what an IPv6 literal's `[::1]:port` splits to.
+                    !hostName.startsWith('[') &&
+                    isIP(hostName) === 0 &&
+                    hostName !== 'localhost'
+                ) {
+                    req.is_custom_domain = true;
+                }
                 next();
                 return;
             }
@@ -613,15 +689,7 @@ export class PuterServer {
                 return;
             }
 
-            const hostName = (req.headers.host ?? '')
-                .split(':')[0]
-                .trim()
-                .toLowerCase();
-            const allowed = this.#getAllowedDomains();
-
-            if (
-                allowed.some((d) => PuterServer.#hostMatchesDomain(hostName, d))
-            ) {
+            if (isOwnHost) {
                 next();
                 return;
             }
@@ -1675,7 +1743,12 @@ export class PuterServer {
      */
     async #runHook(
         order: 'bottomUp' | 'topDown',
-        hook: 'onServerStart' | 'onServerPrepareShutdown' | 'onServerShutdown',
+        hook:
+            | 'onServerStart'
+            | 'onServerDrainStart'
+            | 'onServerPrepareShutdown'
+            | 'onServerShutdown',
+        info?: ServerDrainInfo,
     ) {
         const layers = [
             this.clients,
@@ -1687,7 +1760,7 @@ export class PuterServer {
         if (order === 'topDown') layers.reverse();
         for (const layer of layers) {
             for (const instance of Object.values(layer) as WithLifecycle[]) {
-                await instance[hook]?.();
+                await instance[hook]?.(info);
             }
         }
     }
@@ -1704,8 +1777,13 @@ export class PuterServer {
         await this.#runHook('bottomUp', 'onServerPrepareShutdown');
     }
 
-    async prepareShutdown() {
+    async prepareShutdown(info: ServerDrainInfo = {}) {
         if (this.#server) {
+            try {
+                await this.#runHook('bottomUp', 'onServerDrainStart', info);
+            } catch (err) {
+                console.error('[server] onServerDrainStart failed', err);
+            }
             this.#server.close(async () => {
                 console.log(
                     'PuterServer has stopped accepting new connections',

@@ -18,7 +18,7 @@
  * @template [T=KVScalar]
  * @typedef {Object} KVSetItem
  * @property {string} key The key to create or update. Maximum key size is `1 KB`.
- * @property {T} value The value to store. Maximum value size is `400 KB`.
+ * @property {T} value The value to store. Maximum value size is `399 KB`.
  * @property {number | null} [expireAt] Timestamp, in seconds, at which the key should expire.
  * Omit or pass `null` for no expiry.
  */
@@ -29,7 +29,7 @@
  * @template [T=KVScalar]
  * @typedef {Object} KVSetObject
  * @property {string} key The key to create or update. Maximum key size is `1 KB`.
- * @property {T} value The value to store. Maximum value size is `400 KB`.
+ * @property {T} value The value to store. Maximum value size is `399 KB`.
  * @property {number | null} [expireAt] Timestamp, in seconds, at which the key should expire.
  * Omit or pass `null` for no expiry.
  * @property {KVOptConfig} [optConfig]
@@ -141,9 +141,10 @@
  * @property {string} [appUuid] Address another app's namespace instead of this app's own. Requires
  * access to that app's data, which `puter.perms.request('appData', { app, scopes })` asks the user for.
  * @property {string} [handle] Address a region another user shared with you, by the `handle` from
- * `listShared()`. Keys and list patterns are then relative to the shared prefix. Needs `read` access
- * for `get` and `list`, and `write` for every other method; `flush` is refused. Rejected when
- * combined with `appUuid` or `disableSharing`.
+ * `listShared()`. Keys and list patterns are then relative to the shared prefix. `watch` access is
+ * enough to `list` keys without values, `read` adds `get` and listing with values, and `write` adds
+ * every method that changes keys; `flush` is refused. Rejected when combined with `appUuid` or
+ * `disableSharing`.
  * @property {boolean} [onlyIfAbsent] `set()` only: write the key only when it has no live entry.
  * `set()` then resolves to `false` instead of overwriting. Two writes at nearly the same time can
  * both succeed. Rejected on the batch form.
@@ -160,7 +161,8 @@
 
 /**
  * What a share lets its holder do. Each level includes the ones before it: `watch` delivers change
- * events, `read` adds `get` and `list`, and `write` adds every method that changes or deletes keys.
+ * events and lists keys without values, `read` adds `get` and values, and `write` adds every method
+ * that changes or deletes keys.
  *
  * @typedef {'watch' | 'read' | 'write'} KVShareAccess
  */
@@ -182,6 +184,8 @@
  * @property {KVShareAccess} [access] Defaults to `'read'`.
  * @property {string | null} [label] Plain text the holder is shown, up to 128 characters. Omit it to
  * keep the current label when sharing again, or pass `null` to clear it.
+ * @property {boolean} [notify] Whether you and the holder can send each other notifications through
+ * the share. Defaults to `false`. Omit it to keep the current setting when sharing again.
  * @property {string} [appUuid] The app whose data to share. Outside an app it can name any app, and
  * defaults to the app-less store. An app always shares its own data.
  */
@@ -196,7 +200,41 @@
  * @property {string | null} appUid The app whose data is shared, or `null` for the app-less store.
  * @property {string} holder The holder's username.
  * @property {string | null} label The label the holder is shown.
+ * @property {boolean} notify Whether you and the holder can notify each other through the share.
  * @property {number} createdAt When the share was made, in Unix seconds.
+ */
+
+/**
+ * Options form of `share()` for several recipients at once.
+ *
+ * @typedef {Object} KVShareManyOptions
+ * @property {string} prefix The key prefix to share, as in `KVShareOptions`.
+ * @property {KVShareRecipient[]} recipients Who to share it with, 1 to 50 users.
+ * @property {KVShareAccess} [access] Defaults to `'read'`.
+ * @property {string | null} [label] As in `KVShareOptions`, the same for every recipient.
+ * @property {boolean} [notify] As in `KVShareOptions`, the same for every recipient.
+ * @property {string} [appUuid] As in `KVShareOptions`.
+ */
+
+/**
+ * One recipient's share in a `share()` call with several recipients.
+ *
+ * @typedef {KVShare & { recipient: KVShareRecipient }} KVShareManyShared
+ */
+
+/**
+ * One recipient `share()` couldn't share with, in a call with several recipients.
+ *
+ * @typedef {Object} KVShareManyFailed
+ * @property {KVShareRecipient} recipient The recipient as you passed it.
+ * @property {{ message: string, code: string }} error Why it wasn't shared, with the same codes a
+ * single `share()` rejects with.
+ */
+
+/**
+ * One recipient's outcome in a `share()` call with several recipients: a share, or an `error`.
+ *
+ * @typedef {KVShareManyShared | KVShareManyFailed} KVShareManyItem
  */
 
 /**
@@ -216,6 +254,7 @@
  * @property {string | null} holder The holder's username. A share is deleted with its holder's
  * account.
  * @property {string | null} label The label the holder is shown.
+ * @property {boolean} notify Whether you and the holder can notify each other through the share.
  * @property {number} createdAt When the share was made, in Unix seconds.
  * @property {number | null} revokedAt When the share stopped, in Unix seconds, or `null` while it's
  * live.
@@ -231,16 +270,37 @@
  * @property {KVShareAccess} access What you can do.
  * @property {string | null} appUid The app whose data it is, or `null` for the app-less store.
  * @property {string | null} label Plain text the owner set. Render it as text, never as HTML.
+ * @property {boolean} notify Whether you and the owner can notify each other through the share.
  * @property {number} createdAt When the share was made, in Unix seconds.
  */
 
 /**
- * Options for `listShared()` and `listSharedByMe()`.
+ * Options for `listShared()`.
  *
  * @typedef {Object} KVShareListOptions
  * @property {number} [limit] Shares per page. Defaults to `50`, at most `200`.
  * @property {string} [cursor] The `cursor` from the previous page.
  * @property {boolean} [includeTotal] Add `total`, the number of shares across every page.
+ * @property {string | null} [appUid] Only the shares of this app's data, or `null` for the app-less
+ * store. In an app, only that app's own uid is accepted.
+ */
+
+/**
+ * Which shares `listSharedByMe()` returns: live ones, stopped ones, or both.
+ *
+ * @typedef {'live' | 'revoked' | 'all'} KVShareState
+ */
+
+/**
+ * Options for `listSharedByMe()`.
+ *
+ * @typedef {Object} KVSharedByMeListOptions
+ * @property {number} [limit] Shares per page. Defaults to `50`, at most `200`.
+ * @property {string} [cursor] The `cursor` from the previous page.
+ * @property {boolean} [includeTotal] Add `total`, the number of shares across every page.
+ * @property {string | null} [appUid] Only the shares of this app's data, or `null` for the app-less
+ * store. In an app, only that app's own uid is accepted.
+ * @property {KVShareState} [state] Defaults to `'all'`.
  */
 
 /**

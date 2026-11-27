@@ -45,6 +45,8 @@ import {
     kvSharePermission,
     type KvShareAccess,
 } from '../../services/kvShare/kvShares.js';
+import { claimCountedRateLimit } from '../../core/http/middleware/rateLimit.js';
+import { kvNamespace } from '../../stores/systemKv/SystemKVStore.js';
 import {
     createTestUser,
     setupPuterTestEnv,
@@ -54,6 +56,7 @@ import {
 import type { IConfig } from '../../types.js';
 import { openCursor, sealCursor } from '../../util/pagination.js';
 import type { KVStoreDriver } from './KVStoreDriver.js';
+import { KV_HANDLE_NAMESPACE_BUDGET } from './limits.js';
 
 const BOOT_TIMEOUT_MS = 120_000;
 const GLOBAL = 'os-global';
@@ -182,6 +185,14 @@ const appActorFor = (user: TestUser, app: { uid: string; id: number }) =>
         app: { uid: app.uid, id: app.id },
     });
 
+/** What launching the app records: the user authorizing it. */
+const authorizeApp = (user: TestUser, app: { uid: string }) =>
+    env.server.services.permission.grantUserAppPermission(
+        user.actor,
+        app.uid,
+        'flag:app-is-authenticated',
+    );
+
 /** One `/drivers/call` to the KV driver, the way the SDK makes it. */
 const drive = async (
     token: string,
@@ -235,6 +246,36 @@ afterAll(async () => {
     await env?.shutdown();
 });
 
+/**
+ * The handle budget calls into `owner`'s namespace spend from: every holder's,
+ * or with `holder`, that holder's own.
+ */
+const budgetKey = (owner: TestUser, holder?: TestUser, appUid = GLOBAL) => {
+    const namespace = `kv:handles:${kvNamespace(owner.uuid, appUid)}`;
+    return holder ? `${namespace}:holder:${holder.id}` : namespace;
+};
+
+/** A budget's counters for this window and the one before. */
+const budgetCounters = (key: string) => {
+    const index = Math.floor(Date.now() / KV_HANDLE_NAMESPACE_BUDGET.window);
+    return [index - 1, index].map((at) => `ratec:{${key}}:${at}`);
+};
+
+/** Units spent from a budget since it was last cleared. */
+const spent = async (key: string) => {
+    let total = 0;
+    for (const counter of budgetCounters(key))
+        total += Number(await env.server.clients.redis.get(counter));
+    return total;
+};
+
+const clearBudget = (key: string) =>
+    env.server.clients.redis.del(...budgetCounters(key));
+
+/** Spend all of a budget, as though other calls had. */
+const exhaust = (key: string, limit: number) =>
+    claimCountedRateLimit(key, limit, KV_HANDLE_NAMESPACE_BUDGET.window, limit);
+
 // Every mint spends the 60/min budget, and this file makes more than that.
 beforeEach(async () => {
     for (const user of [owner, guest, stranger]) {
@@ -242,7 +283,9 @@ beforeEach(async () => {
             `rate:${EVENTS_KV_HANDLE_LIMIT.scope}:${user.id}`,
         );
         await env.server.clients.redis.del(`rate:events:subscribe:${user.id}`);
+        await clearBudget(budgetKey(owner, user));
     }
+    await clearBudget(budgetKey(owner));
 });
 
 describe('a call through a handle', () => {
@@ -401,6 +444,17 @@ describe('the level a call needs', () => {
         await expect(guestGet(watch.handle, 'k')).rejects.toMatchObject({
             legacyCode: 'kv_handle_access_denied',
         });
+    });
+
+    it('keeps working after the owner stops a legacy share spelled in another case', async () => {
+        const tag = uuidv4().slice(0, 8);
+        const legacy = await legacyShare(`Notes-${tag}:`, 'read');
+        await ownerSet(`notes-${tag}:x:k`, 'v');
+        const { handle } = await share(`notes-${tag}:x:`, 'read');
+
+        await shares().removeKvShare(owner.actor, legacy.handle);
+
+        expect(await guestGet(handle, 'k')).toBe('v');
     });
 });
 
@@ -859,11 +913,12 @@ describe('listing through a handle', () => {
 });
 
 describe('a private entry in the region', () => {
-    it('is absent to the holder, uncounted, and refuses every write', async () => {
+    it('is absent to the holder, uncounted, and gives nothing away to a write', async () => {
         const prefix = region('priv');
         await ownerSet(`${prefix}open`, 1);
         await ownerSet(`${prefix}secret`, 's', { disableSharing: true });
         const { handle } = await share(prefix, 'write');
+        const { handle: readOnly } = await share(region('privro'), 'read');
 
         expect(await guestGet(handle, 'secret')).toBeNull();
         expect(await guestGet(handle, ['open', 'secret'])).toEqual([1, null]);
@@ -878,10 +933,44 @@ describe('a private entry in the region', () => {
             ),
         ).toEqual({ items: ['open'], total: 1 });
 
+        // Deleting it answers as deleting a key that isn't there.
+        expect(
+            await as(guest.actor, (d) =>
+                d.del({ key: 'secret', ...via(handle) }),
+            ),
+        ).toBe(true);
+        expect(
+            await as(guest.actor, (d) =>
+                d.del({ key: 'never-written', ...via(handle) }),
+            ),
+        ).toBe(true);
+        expect(
+            await as(guest.actor, (d) =>
+                d.remove({ key: 'secret', paths: [''], ...via(handle) }),
+            ),
+        ).toBeNull();
+
+        // Anything else is refused as a call the handle doesn't allow.
+        let levelRefusal: unknown;
+        try {
+            await guestSet(readOnly, 'k', 1);
+        } catch (err) {
+            levelRefusal = err;
+        }
+        const { statusCode, legacyCode, message } = levelRefusal as Record<
+            string,
+            unknown
+        >;
+        expect(legacyCode).toBe('kv_handle_access_denied');
         for (const call of [
             (d: KVStoreDriver) =>
                 d.set({ key: 'secret', value: 'x', ...via(handle) }),
-            (d: KVStoreDriver) => d.del({ key: 'secret', ...via(handle) }),
+            (d: KVStoreDriver) =>
+                d.set({
+                    key: 'secret',
+                    value: 'x',
+                    ...via(handle, { onlyIfAbsent: true }),
+                }),
             (d: KVStoreDriver) =>
                 d.update({
                     key: 'secret',
@@ -889,7 +978,33 @@ describe('a private entry in the region', () => {
                     ...via(handle),
                 }),
             (d: KVStoreDriver) =>
+                d.add({
+                    key: 'secret',
+                    pathAndValueMap: { list: 1 },
+                    ...via(handle),
+                }),
+            (d: KVStoreDriver) =>
+                d.remove({ key: 'secret', paths: ['a'], ...via(handle) }),
+            (d: KVStoreDriver) =>
+                d.incr({
+                    key: 'secret',
+                    pathAndAmountMap: { n: 1 },
+                    ...via(handle),
+                }),
+            (d: KVStoreDriver) =>
+                d.decr({
+                    key: 'secret',
+                    pathAndAmountMap: { n: 1 },
+                    ...via(handle),
+                }),
+            (d: KVStoreDriver) =>
                 d.expire({ key: 'secret', ttl: 60, ...via(handle) }),
+            (d: KVStoreDriver) =>
+                d.expireAt({
+                    key: 'secret',
+                    timestamp: later(),
+                    ...via(handle),
+                }),
             (d: KVStoreDriver) =>
                 d.batchPut({
                     items: [
@@ -900,18 +1015,23 @@ describe('a private entry in the region', () => {
                 }),
         ])
             await expect(as(guest.actor, call)).rejects.toMatchObject({
-                statusCode: 403,
+                statusCode,
+                legacyCode,
+                message,
             });
+
+        // A live key that isn't private still refuses `onlyIfAbsent` quietly.
         expect(
             await as(guest.actor, (d) =>
                 d.set({
-                    key: 'secret',
+                    key: 'open',
                     value: 'x',
                     ...via(handle, { onlyIfAbsent: true }),
                 }),
             ),
         ).toBe(false);
         expect(await ownerGet(`${prefix}secret`)).toBe('s');
+        expect(await ownerGet(`${prefix}open`)).toBe(1);
     });
 });
 
@@ -922,6 +1042,8 @@ describe('an app using a handle', () => {
     beforeAll(async () => {
         app = await makeApp();
         otherApp = await makeApp();
+        await authorizeApp(guest, app);
+        await authorizeApp(guest, otherApp);
     });
 
     it('works in the app whose data it is, and in the holder`s own session', async () => {
@@ -1025,6 +1147,7 @@ describe('a token using a handle', () => {
         );
         const inApp = await share(appPrefix, 'read', { appUid: app.uid });
         await share(appElsewhere, 'read', { appUid: app.uid });
+        await authorizeApp(guest, app);
         const appActor = appActorFor(guest, app);
 
         const carrying = await tokenActor(
@@ -1164,6 +1287,44 @@ describe('what a write publishes', () => {
         });
     });
 
+    it('publishes a holder`s delete of a missing key, and nothing for a private one', async () => {
+        const prefix = region('pdel');
+        await ownerSet(`${prefix}secret`, 's', { disableSharing: true });
+        const { handle } = await share(prefix, 'write');
+        const ownerSub = (
+            await events().subscribe(owner.actor, SOCKET, {
+                subject: `kv:${GLOBAL}:${prefix}*`,
+            })
+        ).sub;
+        const guestSub = (
+            await events().subscribe(guest.actor, SOCKET, {
+                subject: `kv:${handle}:*`,
+            })
+        ).sub;
+        delivered.length = 0;
+
+        await as(guest.actor, (d) => d.del({ key: 'secret', ...via(handle) }));
+        await as(guest.actor, (d) => d.del({ key: 'missing', ...via(handle) }));
+
+        expect(await deliveryFor(guestSub.subId)).toMatchObject({
+            key: 'missing',
+        });
+        expect(await deliveryFor(ownerSub.subId)).toMatchObject({
+            key: `${prefix}missing`,
+        });
+        await new Promise((resolve) =>
+            setTimeout(resolve, EVENTS_COALESCE_WINDOW_MS * 2),
+        );
+        const keys = delivered
+            .filter((one) =>
+                [ownerSub.subId, guestSub.subId].includes(one.subId),
+            )
+            .map((one) => (one.event as { key?: string }).key);
+        expect(keys).not.toContain('secret');
+        expect(keys).not.toContain(`${prefix}secret`);
+        expect(await ownerGet(`${prefix}secret`)).toBe('s');
+    });
+
     it('marks the owner`s own writes as theirs, and a worker`s or handler`s as via a worker', async () => {
         const prefix = region('via');
         const sub = (
@@ -1286,6 +1447,157 @@ describe('what a call costs', () => {
     });
 });
 
+describe('the handle budget of a namespace', () => {
+    const { limit, perHolder } = KV_HANDLE_NAMESPACE_BUDGET;
+
+    it('is spent by every holder together, and refuses them all once it is gone', async () => {
+        const prefix = region('budget');
+        await ownerSet(`${prefix}k`, 'v');
+        const forGuest = await share(prefix, 'read');
+        const forStranger = await share(prefix, 'read', { holder: stranger });
+
+        expect(await guestGet(forGuest.handle, 'k')).toBe('v');
+        expect(await guestGet(forStranger.handle, 'k', stranger.actor)).toBe(
+            'v',
+        );
+        expect(await spent(budgetKey(owner))).toBe(2);
+        expect(await spent(budgetKey(owner, guest))).toBe(1);
+
+        await exhaust(budgetKey(owner), limit);
+        for (const call of [
+            () => guestGet(forGuest.handle, 'k'),
+            () => guestGet(forStranger.handle, 'k', stranger.actor),
+        ])
+            await expect(call()).rejects.toMatchObject({
+                statusCode: 429,
+                legacyCode: 'too_many_requests',
+            });
+        // The owner's own calls spend none of it, with a handle or without.
+        expect(await ownerGet(`${prefix}k`)).toBe('v');
+        expect(await guestGet(forGuest.handle, 'k', owner.actor)).toBe('v');
+        // Another owner's namespace has its own.
+        const { handle: elsewhere } = await shares().mintKvHandle(
+            guest.actor,
+            {
+                prefix: region('budget-other'),
+                recipient: { username: owner.username },
+                access: 'read',
+            },
+            { defaultAccess: 'read' },
+        );
+        expect(await guestGet(elsewhere, 'k', owner.actor)).toBeNull();
+
+        await clearBudget(budgetKey(owner));
+        expect(await guestGet(forGuest.handle, 'k')).toBe('v');
+    });
+
+    it('keeps one holder to its share, while the others get through', async () => {
+        const prefix = region('fair');
+        await ownerSet(`${prefix}k`, 'v');
+        const forGuest = await share(prefix, 'read');
+        const forStranger = await share(prefix, 'read', { holder: stranger });
+        expect(perHolder).toBeLessThan(limit);
+
+        await exhaust(budgetKey(owner, guest), perHolder);
+        await expect(guestGet(forGuest.handle, 'k')).rejects.toMatchObject({
+            statusCode: 429,
+            legacyCode: 'too_many_requests',
+        });
+        expect(await guestGet(forStranger.handle, 'k', stranger.actor)).toBe(
+            'v',
+        );
+        // The throttled holder's refusals spent nothing of the namespace's.
+        expect(await spent(budgetKey(owner))).toBe(1);
+    });
+
+    it('spends nothing when the owner calls through a handle', async () => {
+        const prefix = region('own');
+        await ownerSet(`${prefix}k`, 'v');
+        const { handle } = await share(prefix, 'read');
+        await exhaust(budgetKey(owner, owner), perHolder);
+
+        for (let i = 0; i < 3; i++)
+            expect(await guestGet(handle, 'k', owner.actor)).toBe('v');
+        expect(await spent(budgetKey(owner))).toBe(0);
+        await exhaust(budgetKey(owner), limit);
+        expect(await guestGet(handle, 'k', owner.actor)).toBe('v');
+    });
+
+    it('refuses a throttled holder before looking at its grant', async () => {
+        const { handle } = await share(region('early'), 'read');
+        await exhaust(budgetKey(owner, guest), perHolder);
+        const checks = vi.spyOn(env.server.services.permission, 'check');
+        try {
+            await expect(guestGet(handle, 'k')).rejects.toMatchObject({
+                statusCode: 429,
+            });
+            expect(checks).not.toHaveBeenCalled();
+        } finally {
+            checks.mockRestore();
+        }
+    });
+
+    it('is only heard by a caller the grant admits', async () => {
+        const { handle } = await share(region('heard'), 'watch');
+        await exhaust(budgetKey(owner), limit);
+        // Below the level: refused for that, not for the budget.
+        await expect(guestGet(handle, 'k')).rejects.toMatchObject({
+            legacyCode: 'kv_handle_access_denied',
+        });
+    });
+
+    it('tells another app of the holder the handle is not there, however spent', async () => {
+        const app = await makeApp();
+        const otherApp = await makeApp();
+        await authorizeApp(guest, app);
+        await authorizeApp(guest, otherApp);
+        const { handle } = await share(region('apps'), 'read', {
+            appUid: app.uid,
+        });
+        const holderBudget = budgetKey(owner, guest, app.uid);
+        await clearBudget(holderBudget);
+        await exhaust(holderBudget, perHolder);
+
+        await expect(
+            guestGet(handle, 'k', appActorFor(guest, otherApp)),
+        ).rejects.toMatchObject({ legacyCode: 'kv_handle_not_found' });
+        await expect(
+            guestGet(handle, 'k', appActorFor(guest, app)),
+        ).rejects.toMatchObject({ statusCode: 429 });
+        await clearBudget(holderBudget);
+    });
+
+    it('charges a call by the storage it reads and writes', async () => {
+        const prefix = region('cost');
+        const { handle } = await share(prefix, 'write');
+        const big = 'x'.repeat(100 * 1024);
+        for (const key of ['a', 'b', 'c', 'd'])
+            await ownerSet(`${prefix}big:${key}`, big);
+        const both = async () => [
+            await spent(budgetKey(owner)),
+            await spent(budgetKey(owner, guest)),
+        ];
+        expect(await both()).toEqual([0, 0]);
+
+        await guestSet(handle, 'small', 'x');
+        await vi.waitFor(async () => expect(await both()).toEqual([3, 3]));
+        expect(await guestGet(handle, 'small')).toBe('x');
+        await vi.waitFor(async () => expect(await both()).toEqual([4, 4]));
+
+        const page = (await as(guest.actor, (d) =>
+            d.list({ as: 'entries', pattern: 'big:*', ...via(handle) }),
+        )) as unknown[];
+        expect(page).toHaveLength(4);
+        // About 400 KB read, at a unit per 8 KB.
+        await vi.waitFor(async () => {
+            for (const units of await both()) {
+                expect(units).toBeGreaterThanOrEqual(4 + 50);
+                expect(units).toBeLessThan(4 + 60);
+            }
+        });
+    });
+});
+
 describe('what a holder is ever shown', () => {
     it('names no owner, prefix or whole key in any answer, success or error', async () => {
         const prefix = region('scan');
@@ -1404,6 +1716,253 @@ describe('what a holder is ever shown', () => {
             expect(body).not.toContain(owner.username);
             for (const region of [prefix, readPrefix])
                 expect(body).not.toContain(region.slice(0, -1));
+        }
+    });
+});
+
+describe('a handle id', () => {
+    /** Statements against the handle table while `call` runs. */
+    const handleReads = async (call: () => Promise<unknown>) => {
+        const read = vi.spyOn(env.server.clients.db, 'read');
+        const pread = vi.spyOn(env.server.clients.db, 'pread');
+        const touches = (spy: typeof read) =>
+            spy.mock.calls.filter(([sql]) =>
+                String(sql).includes('kv_share_handles'),
+            ).length;
+        try {
+            await call();
+        } catch {
+            // The caller asserts on the answer separately.
+        }
+        const counts = { read: touches(read), pread: touches(pread) };
+        read.mockRestore();
+        pread.mockRestore();
+        return counts;
+    };
+
+    it('is refused without a store read when its mac does not verify', async () => {
+        const prefix = region('forged');
+        await ownerSet(`${prefix}k`, 'v');
+        const { handle } = await share(prefix, 'read');
+        const [id, mac] = handle.split('.');
+        const forged = `${id}.${mac[0] === 'A' ? 'B' : 'A'}${mac.slice(1)}`;
+
+        await expect(guestGet(forged, 'k')).rejects.toMatchObject({
+            legacyCode: 'kv_handle_not_found',
+        });
+        expect(await handleReads(() => guestGet(forged, 'k'))).toEqual({
+            read: 0,
+            pread: 0,
+        });
+        await expect(
+            events().subscribe(guest.actor, 'kv-forged-socket', {
+                subject: `kv:${forged}:*`,
+            }),
+        ).rejects.toMatchObject({ legacyCode: 'subject_does_not_exist' });
+        expect(await guestGet(handle, 'k')).toBe('v');
+    });
+
+    it('minted before ids were signed still works, and never falls back to the primary', async () => {
+        const prefix = region('legacy-id');
+        await ownerSet(`${prefix}k`, 'old');
+        const permission = kvSharePermission(
+            owner.uuid,
+            GLOBAL,
+            prefix,
+            'read',
+        );
+        await env.server.services.permission.grantUserUserPermission(
+            owner.actor,
+            guest.username,
+            permission,
+        );
+        const legacy = `kvh-${uuidv4()}`;
+        await env.server.clients.db.insert('kv_share_handles', {
+            handle: legacy,
+            owner_user_id: owner.id,
+            grantee_user_id: guest.id,
+            app_uid: GLOBAL,
+            key_prefix: prefix,
+            permission,
+            label: null,
+            created_at: Math.floor(Date.now() / 1000),
+            revoked_at: null,
+        });
+
+        expect(await guestGet(legacy, 'k')).toBe('old');
+        expect(
+            await handleReads(() => guestGet(`kvh-${uuidv4()}`, 'k')),
+        ).toEqual({ read: 1, pread: 0 });
+    });
+});
+
+describe('a handle used by an app its holder removed', () => {
+    const revokeAll = async (appUid: string) => {
+        const res = await fetch(
+            new URL('/auth/revoke-user-app', env.apiOrigin),
+            {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    authorization: `Bearer ${guest.creds.token}`,
+                },
+                body: JSON.stringify({ app_uid: appUid, permission: '*' }),
+            },
+        );
+        expect(res.status, await res.text()).toBe(200);
+    };
+
+    it('is absent to the app until it is authorized again, and the holder keeps it', async () => {
+        const app = await makeApp();
+        const prefix = region('removed');
+        await as(appActorFor(owner, app), (d) =>
+            d.set({ key: `${prefix}k`, value: 'in app' }),
+        );
+        const { handle } = await share(prefix, 'read', { appUid: app.uid });
+        await authorizeApp(guest, app);
+        const appActor = appActorFor(guest, app);
+        expect(await guestGet(handle, 'k', appActor)).toBe('in app');
+
+        await revokeAll(app.uid);
+        await expect(guestGet(handle, 'k', appActor)).rejects.toMatchObject({
+            legacyCode: 'kv_handle_not_found',
+        });
+        expect(await guestGet(handle, 'k')).toBe('in app');
+        expect(await handles().getLive(handle)).not.toBeNull();
+
+        await authorizeApp(guest, app);
+        expect(await guestGet(handle, 'k', appActor)).toBe('in app');
+    });
+
+    it('stops delivering to the app`s live subscription', async () => {
+        const app = await makeApp();
+        const prefix = region('removed-sub');
+        const { handle } = await share(prefix, 'read', { appUid: app.uid });
+        await authorizeApp(guest, app);
+        const socket = 'kv-removed-socket';
+        const { sub } = await events().subscribe(
+            appActorFor(guest, app),
+            socket,
+            { subject: `kv:${handle}:*` },
+        );
+        const writes = (key: string) =>
+            as(appActorFor(owner, app), (d) =>
+                d.set({ key: `${prefix}${key}`, value: 1 }),
+            );
+
+        delivered.length = 0;
+        await writes('a');
+        await vi.waitFor(
+            () =>
+                expect(delivered.some((one) => one.subId === sub.subId)).toBe(
+                    true,
+                ),
+            { timeout: EVENTS_COALESCE_WINDOW_MS * 12, interval: 25 },
+        );
+
+        await revokeAll(app.uid);
+        delivered.length = 0;
+        await writes('b');
+        await new Promise((resolve) =>
+            setTimeout(resolve, EVENTS_COALESCE_WINDOW_MS * 3),
+        );
+        expect(delivered.some((one) => one.subId === sub.subId)).toBe(false);
+        await events().reapSocket(guest.id, socket);
+    });
+});
+
+describe('listing keys through a watch handle', () => {
+    it('returns keys relative to the handle, and refuses values', async () => {
+        const prefix = region('watch-keys');
+        await ownerSet(`${prefix}a`, 1);
+        await ownerSet(`${prefix}b:c`, 2);
+        const { handle } = await share(prefix, 'watch');
+
+        await expect(
+            as(guest.actor, (d) =>
+                d.list({ as: 'keys', includeTotal: true, ...via(handle) }),
+            ),
+        ).resolves.toEqual({ items: ['a', 'b:c'], total: 2 });
+        for (const as_ of ['entries', 'values', undefined] as const)
+            await expect(
+                as(guest.actor, (d) => d.list({ as: as_, ...via(handle) })),
+            ).rejects.toMatchObject({ legacyCode: 'kv_handle_access_denied' });
+        await expect(guestGet(handle, 'a')).rejects.toMatchObject({
+            legacyCode: 'kv_handle_access_denied',
+        });
+    });
+
+    it('works for the owner through their own handle', async () => {
+        const prefix = region('watch-owner');
+        await ownerSet(`${prefix}a`, 1);
+        const { handle } = await share(prefix, 'watch');
+        await expect(
+            as(owner.actor, (d) => d.list({ as: 'keys', ...via(handle) })),
+        ).resolves.toEqual(['a']);
+    });
+});
+
+describe('a handle whose owner is suspended', () => {
+    const suspendable = async () =>
+        userFor(
+            await createTestUser(env.server, {
+                username: `kv-susp-${uuidv4().slice(0, 8)}`,
+                password: 'pw-test-1234',
+            }),
+        );
+
+    it('cannot be subscribed to, answered as not found', async () => {
+        const suspendee = await suspendable();
+        const { handle } = await share(region('susp-sub'), 'read', {
+            actor: suspendee.actor,
+        });
+        await env.server.stores.user.update(suspendee.id, { suspended: 1 });
+
+        await expect(
+            events().subscribe(guest.actor, 'kv-susp-socket', {
+                subject: `kv:${handle}:*`,
+            }),
+        ).rejects.toMatchObject({ legacyCode: 'subject_does_not_exist' });
+    });
+
+    it('stops delivering to a subscription made before the suspension', async () => {
+        const suspendee = await suspendable();
+        const prefix = region('susp-deliver');
+        const { handle } = await share(prefix, 'read', {
+            actor: suspendee.actor,
+        });
+        const socket = 'kv-susp-deliver-socket';
+        const { sub } = await events().subscribe(guest.actor, socket, {
+            subject: `kv:${handle}:*`,
+        });
+        const writes = (key: string) =>
+            as(suspendee.actor, (d) =>
+                d.set({ key: `${prefix}${key}`, value: 1 }),
+            );
+        const reached = () => delivered.some((one) => one.subId === sub.subId);
+
+        delivered.length = 0;
+        await writes('a');
+        await vi.waitFor(() => expect(reached()).toBe(true), {
+            timeout: EVENTS_COALESCE_WINDOW_MS * 12,
+            interval: 25,
+        });
+
+        // The cached row once it refreshes after the suspension.
+        const live = await handles().getLive(handle);
+        const getLive = vi
+            .spyOn(handles(), 'getLive')
+            .mockResolvedValue({ ...live!, ownerSuspended: true });
+        try {
+            delivered.length = 0;
+            await writes('b');
+            await new Promise((resolve) =>
+                setTimeout(resolve, EVENTS_COALESCE_WINDOW_MS * 3),
+            );
+            expect(reached()).toBe(false);
+        } finally {
+            getLive.mockRestore();
+            await events().reapSocket(guest.id, socket);
         }
     });
 });

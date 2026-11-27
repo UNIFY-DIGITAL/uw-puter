@@ -157,7 +157,6 @@ const subscribeBackgroundHandler = async (
         subject: `fs:${anchor}`,
         delivery: 'single',
         handlerName,
-        targets: ['worker'],
     });
     expect(subscribed.status).toBe(200);
     return subscribed.body.subId as string;
@@ -198,6 +197,39 @@ describe('an app deleted while it has events state', () => {
         );
     });
 
+    it("clears the rows and handlers of a deleted account's apps, and the account's subscription keys", async () => {
+        const app = await makeApp(userId);
+        await publish(app.token, {
+            appUid: app.uid,
+            name: 'ingestUpload',
+            source: SOURCE,
+        });
+        await subscribeBackgroundHandler(app, 'ingestUpload');
+        // The account itself stays: other tests here sign in as it. A made-up
+        // id stands in for it on the keys the delete drops.
+        const goneUserId = 1_000_000 + Math.floor(Math.random() * 1_000_000);
+        await env.server.stores.eventSubscription.markRegionWarm(goneUserId);
+
+        // What account deletion emits once the row and its apps are gone.
+        await env.server.clients.event.emitAndWait(
+            'user.delete',
+            { user_id: goneUserId, appUids: [app.uid] },
+            {},
+        );
+
+        const listed = await env.server.stores.durableSubscription.listForHolder(
+            userId,
+            { appUid: app.uid },
+        );
+        expect(listed.items).toEqual([]);
+        expect(await env.server.stores.eventHandler.listForApp(app.uid)).toEqual(
+            [],
+        );
+        expect(
+            await env.server.stores.eventSubscription.isRegionWarm(goneUserId),
+        ).toBe(false);
+    });
+
     it('retires every holder session for a deleted app', async () => {
         const app = await makeApp(userId);
         await publish(app.token, {
@@ -221,7 +253,6 @@ describe('an app deleted while it has events state', () => {
             match: null,
             op: null,
             delivery: 'single',
-            targets: ['worker'],
             handlerName: 'ingestUpload',
             context: null,
             permission: 'list',

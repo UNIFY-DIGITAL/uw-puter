@@ -709,6 +709,20 @@ export class ChatCompletionDriver extends PuterDriver {
                 legacyCode: 'bad_request',
             });
         }
+        // A pinned provider without a route for the model normally resolves
+        // to another vendor; with `fallback: false` that is the one thing the
+        // caller asked us not to do.
+        if (
+            args.fallback === false &&
+            intendedProvider &&
+            model.provider !== intendedProvider
+        ) {
+            throw new HttpError(
+                400,
+                `Model ${args.model} is not served by provider ${intendedProvider}`,
+                { legacyCode: 'bad_request' },
+            );
+        }
 
         args.messages = normalizeMediaParts(normalize_messages(args.messages));
         if (args.tools) {
@@ -816,6 +830,9 @@ export class ChatCompletionDriver extends PuterDriver {
         // where "done" is the stream draining rather than this method
         // returning.
         let hold: CreditHold = NO_CREDIT_HOLD;
+        // The gate's estimate for the current attempt: the message estimate
+        // plus whatever its provider reads back as prompt beyond the messages.
+        let attemptPromptTokenEstimate = promptTokenEstimate;
         // The current attempt's balance-bound output cap, if it had one.
         let fundsCap: number | undefined;
         // The cost factor the current attempt's charges are recorded at.
@@ -824,12 +841,16 @@ export class ChatCompletionDriver extends PuterDriver {
         // charge, so a rate change mid-request can't split the two.
         let pricingTime = new Date();
         if (!useFakeProvider) {
-            ({ hold, fundsCap, costFactor } = await this.#applyCreditGate(
-                actor,
-                model,
-                args,
-                { promptTokenEstimate, requestedMaxTokens, pricingTime },
-            ));
+            ({
+                hold,
+                fundsCap,
+                costFactor,
+                promptTokenEstimate: attemptPromptTokenEstimate,
+            } = await this.#applyCreditGate(actor, model, args, {
+                promptTokenEstimate,
+                requestedMaxTokens,
+                pricingTime,
+            }));
         }
 
         // First attempt
@@ -939,8 +960,15 @@ export class ChatCompletionDriver extends PuterDriver {
             const bucketKey = model.id;
             const tried = new Set([routeId(model.provider!, model.id)]);
             let lastError: Error | null = e as Error;
+            // With `fallback: false` the caller wants this route's answer or
+            // its error, not a bill for another provider's attempt.
+            const fallbackAllowed = args.fallback !== false;
 
-            while (lastError && attempts.length < MAX_ATTEMPTS) {
+            while (
+                fallbackAllowed &&
+                lastError &&
+                attempts.length < MAX_ATTEMPTS
+            ) {
                 const fallback = this.#findFallback(bucketKey, tried);
                 if (!fallback) break;
 
@@ -957,12 +985,16 @@ export class ChatCompletionDriver extends PuterDriver {
                 // this one starts from nothing held.
                 pricingTime = new Date();
                 if (!useFakeProvider) {
-                    ({ hold, fundsCap, costFactor } =
-                        await this.#applyCreditGate(actor, fallback, args, {
-                            promptTokenEstimate,
-                            requestedMaxTokens,
-                            pricingTime,
-                        }));
+                    ({
+                        hold,
+                        fundsCap,
+                        costFactor,
+                        promptTokenEstimate: attemptPromptTokenEstimate,
+                    } = await this.#applyCreditGate(actor, fallback, args, {
+                        promptTokenEstimate,
+                        requestedMaxTokens,
+                        pricingTime,
+                    }));
                 }
 
                 tried.add(routeId(fallback.provider!, fallback.id));
@@ -1188,7 +1220,7 @@ export class ChatCompletionDriver extends PuterDriver {
                                 actor,
                                 chatStream,
                                 model,
-                                promptTokenEstimate,
+                                promptTokenEstimate: attemptPromptTokenEstimate,
                                 completionId,
                                 username,
                                 intendedProvider,
@@ -1432,10 +1464,16 @@ export class ChatCompletionDriver extends PuterDriver {
             /** The instant this attempt is priced at. */
             pricingTime: Date;
         },
-    ): Promise<{ hold: CreditHold; fundsCap?: number; costFactor: number }> {
+    ): Promise<{
+        hold: CreditHold;
+        fundsCap?: number;
+        costFactor: number;
+        /** The prompt estimate this attempt was priced on. */
+        promptTokenEstimate: number;
+    }> {
         const metering = this.services.metering;
-        const { promptTokenEstimate, requestedMaxTokens, pricingTime } =
-            estimates;
+        const { requestedMaxTokens, pricingTime } = estimates;
+        let { promptTokenEstimate } = estimates;
         // A provider can name its own cost keys for this request (Claude's
         // fast-mode rate card), cap its output, and size an extra reservation
         // the per-token math can't see (a web-search/advisor tool that could
@@ -1446,6 +1484,7 @@ export class ChatCompletionDriver extends PuterDriver {
             this.#providers[model.provider!]?.requestPricing?.(args, model, {
                 promptTokenEstimate,
             }) ?? {};
+        promptTokenEstimate += pricing.additionalPromptTokens ?? 0;
         const { inputKey: defaultInputKey, outputKey: defaultOutputKey } =
             costKeys(model);
         const inputKey = pricing.inputKey ?? defaultInputKey;
@@ -1560,7 +1599,7 @@ export class ChatCompletionDriver extends PuterDriver {
             actor,
             Math.max(worstCaseCost, minimumCredits),
         );
-        return { hold, fundsCap, costFactor };
+        return { hold, fundsCap, costFactor, promptTokenEstimate };
     }
 
     /** The key `model`'s usage is recorded and cost-factored under. */

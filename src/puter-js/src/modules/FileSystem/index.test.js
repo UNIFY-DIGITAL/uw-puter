@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The module opens a socket in its constructor; nothing here exercises it.
+// The module opens a socket in its constructor; only its handshake and
+// listeners are looked at here.
+const sockets = [];
 vi.mock('socket.io-client', () => ({
-    io: () => ({ on: vi.fn(), disconnect: vi.fn() }),
+    io: (origin, options) => {
+        const socket = { options, on: vi.fn(), disconnect: vi.fn() };
+        sockets.push(socket);
+        return socket;
+    },
 }));
 
 const { PuterJSFileSystemModule } = await import('./index.js');
@@ -137,6 +143,43 @@ describe('auth state', () => {
         expect(fs.socket).not.toBe(previousSocket);
     });
 
+    it('keeps an active socket when credentials and origin have not changed', () => {
+        const fs = makeModule('web');
+        const previous = fs.socket;
+        previous.active = true;
+        fs.onAuthStateChanged();
+        expect(fs.socket).toBe(previous);
+        expect(previous.disconnect).not.toHaveBeenCalled();
+    });
+
+    it('replaces an inactive socket even when credentials are unchanged', () => {
+        const fs = makeModule('web');
+        const previous = fs.socket;
+        previous.active = false;
+        fs.onAuthStateChanged();
+        expect(fs.socket).not.toBe(previous);
+        expect(previous.disconnect).toHaveBeenCalledOnce();
+    });
+
+    it('closes the socket on sign-out without opening an anonymous replacement', () => {
+        const fs = makeModule('web');
+        const previous = fs.socket;
+        fs.puter.authToken = null;
+        fs.onAuthStateChanged();
+        expect(previous.disconnect).toHaveBeenCalledOnce();
+        expect(fs.socket).toBeNull();
+    });
+
+    it('replaces an active socket when the API origin changes', () => {
+        const fs = makeModule('web');
+        const previous = fs.socket;
+        previous.active = true;
+        fs.puter.APIOrigin = 'https://new-api.test';
+        fs.onAuthStateChanged();
+        expect(fs.socket).not.toBe(previous);
+        expect(previous.disconnect).toHaveBeenCalledOnce();
+    });
+
     it('never opens a socket when the client opted out', () => {
         const fs = makeModule('web', false);
 
@@ -144,5 +187,28 @@ describe('auth state', () => {
         const notify = fs.puter.onAuthStateChanged.mock.calls[0][0];
         notify();
         expect(fs.socket).toBeUndefined();
+    });
+});
+
+describe('notification receipts', () => {
+    it('offers to acknowledge receipts and hands each ask to notifications', () => {
+        const fs = makeModule('app');
+        const socket = sockets.at(-1);
+        expect(socket.options.auth).toEqual({
+            auth_token: 'token',
+            acks: ['notif.receipt'],
+        });
+
+        fs.puter.notifications = { _answerReceipt: vi.fn() };
+        const [, onAsk] = socket.on.mock.calls.find(
+            ([name]) => name === 'notif.receipt',
+        );
+        const ack = vi.fn();
+        onAsk({ uid: 'n-1' }, ack);
+
+        expect(fs.puter.notifications._answerReceipt).toHaveBeenCalledWith(
+            { uid: 'n-1' },
+            ack,
+        );
     });
 });

@@ -17,8 +17,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Per-call caps on the public KV driver. Enforced here rather than in the
-// store, whose internal callers batch past them.
+// Caps on the public KV driver. Enforced in the driver rather than the store,
+// whose internal callers batch past them.
 
 /** Keys one array `get` may name. */
 export const KV_MAX_GET_KEYS = 1000;
@@ -31,3 +31,23 @@ export const KV_MAX_BATCH_PUT_ITEMS = 1000;
  * the cursor carries the rest. Matches the SDK's own page size.
  */
 export const KV_MAX_LIST_LIMIT = 1000;
+
+/**
+ * Storage capacity calls through share handles may spend in one owner's
+ * namespace per window: `limit` for every holder together, and `perHolder` for
+ * any one of them, so no holder can starve the others. The owner's own calls
+ * through a handle spend none. Sized to leave about half of what one namespace
+ * can serve to the owner's own app.
+ */
+export const KV_HANDLE_NAMESPACE_BUDGET = {
+    limit: 15_000,
+    perHolder: 3_750,
+    window: 10_000,
+};
+
+/**
+ * What a call spends from those budgets: its read units, plus this many per
+ * write unit, since a write costs the store about three times what a read does.
+ * Every call spends at least one.
+ */
+export const KV_HANDLE_WRITE_UNIT_WEIGHT = 3;

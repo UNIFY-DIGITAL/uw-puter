@@ -43,6 +43,10 @@ import {
     requireUserActorGate,
 } from '../../core/http/middleware/gates.js';
 import {
+    configureRateLimit,
+    listConfiguredRateLimitBackends,
+} from '../../core/http/middleware/rateLimit.js';
+import {
     ROUTES_METADATA_KEY,
     type CollectedRoute,
     type TokenSource,
@@ -50,7 +54,10 @@ import {
 import { PuterServer } from '../../server.js';
 import { createSecret as otpCreateSecret } from '../../services/auth/OTPUtil.js';
 import { kvSharePermission } from '../../services/kvShare/kvShares.js';
-import { FULL_API_ACCESS } from '../../services/permission/consts.js';
+import {
+    FULL_API_ACCESS,
+    NOTIFICATIONS_PUSH_PERMISSION,
+} from '../../services/permission/consts.js';
 import { setupTestServer } from '../../testUtil.js';
 import { resetCardVerificationStatusCache } from '../../util/cardFallback.js';
 import { FS_READ_LIMIT } from '../fs/limits.js';
@@ -1750,6 +1757,40 @@ describe('AuthController.handleLoginOtp + handleLoginRecoveryCode', () => {
         ).rejects.toMatchObject({ statusCode: 400 });
     });
 
+    it('refuses the sign-in while the used-token store is down', async () => {
+        const { user, secret, otpToken } = await startOtpLogin();
+        const token = await otpToken();
+
+        const { default: backend } = listConfiguredRateLimitBackends();
+        configureRateLimit({
+            default: 'redis',
+            redis: {
+                multi: () => {
+                    throw new Error('store down');
+                },
+            },
+        });
+        const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const res = makeRes();
+        try {
+            await expect(
+                controller.handleLoginOtp(
+                    makeReq({ token, code: liveTotp(user.username, secret) }),
+                    res,
+                ),
+            ).rejects.toThrow('store down');
+        } finally {
+            logged.mockRestore();
+            configureRateLimit({
+                default: backend,
+                redis: server.clients.redis,
+                kv: server.stores.kv,
+                metering: server.services.metering,
+            });
+        }
+        expect(res.body).toBeUndefined();
+    });
+
     it('a wrong code leaves the token usable for a retry', async () => {
         const { user, secret, otpToken } = await startOtpLogin();
         const token = await otpToken();
@@ -2177,6 +2218,78 @@ describe('AuthController grant flows', () => {
         expect(
             (rows as Array<{ permission: string }>).map((r) => r.permission),
         ).toContain(permission);
+    });
+
+    it('grant-user-app: grants and revokes notifications:push for an app', async () => {
+        const app = await server.stores.app.create(
+            {
+                name: `tgp-${uuidv4()}`,
+                title: 'TestGrantPushApp',
+                index_url: 'https://example.test/index.html',
+            },
+            { ownerUserId: issuer.id },
+        );
+        const user = await server.stores.user.getById(issuer.id);
+        const appActor = makeActor({
+            user: user!,
+            app: { uid: app.uid, id: app.id },
+        });
+        const hasPush = () =>
+            server.services.permission.check(
+                appActor,
+                NOTIFICATIONS_PUSH_PERMISSION,
+            );
+        expect(await hasPush()).toBe(false);
+
+        // Anything past the bare permission names nothing a prompt describes.
+        await expect(
+            inCtx(issuerActor, () =>
+                controller.handleGrantUserApp(
+                    makeReq(
+                        {
+                            app_uid: app.uid,
+                            permission: `${NOTIFICATIONS_PUSH_PERMISSION}:extra`,
+                        },
+                        { actor: issuerActor },
+                    ),
+                    makeRes(),
+                ),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'permission_not_grantable',
+        });
+        expect(await hasPush()).toBe(false);
+
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    {
+                        app_uid: app.uid,
+                        permission: NOTIFICATIONS_PUSH_PERMISSION,
+                    },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+        expect(await hasPush()).toBe(true);
+
+        await inCtx(issuerActor, () =>
+            controller.handleRevokeUserApp(
+                makeReq(
+                    {
+                        app_uid: app.uid,
+                        permission: NOTIFICATIONS_PUSH_PERMISSION,
+                    },
+                    { actor: issuerActor },
+                ),
+                makeRes(),
+            ),
+        );
+        expect(await hasPush()).toBe(false);
     });
 
     it('grant-user-app: resolves `origin` to the app when app_uid is omitted', async () => {
@@ -7612,6 +7725,46 @@ describe('AuthController permission revokes', () => {
         );
         expect(res.body).toEqual({});
     });
+
+    it('revoke-user-user: refuses a key-value share grant and leaves it standing', async () => {
+        const { actor: ownerActor, user: owner } = await makeUserAndActor();
+        const { user: holder } = await makeUserAndActor();
+        const permissions = ['kv-share', 'kv-share-read', 'kv-share-write'].map(
+            (root) => `${root}:${owner.uuid}:os-global:notes:${uuidv4()}`,
+        );
+        for (const permission of permissions)
+            await server.stores.permission.upsertUserUserPerm(
+                holder.id,
+                owner.id,
+                permission,
+                {},
+            );
+
+        for (const permission of permissions)
+            await expect(
+                inCtx(ownerActor, () =>
+                    controller.handleRevokeUserUser(
+                        makeReq(
+                            { target_username: holder.username, permission },
+                            { actor: ownerActor },
+                        ),
+                        makeRes(),
+                    ),
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 400,
+                message: expect.stringContaining('puter.kv.unshare()'),
+            });
+        expect(
+            (
+                await server.stores.permission.findUserUserPermsByIssuer(
+                    holder.id,
+                    owner.id,
+                    permissions,
+                )
+            ).sort(),
+        ).toEqual([...permissions].sort());
+    });
 });
 
 // ── Permission checks + listing ────────────────────────────────────
@@ -7715,6 +7868,12 @@ describe('AuthController.handleCheckPermissions + handleListPermissions', () => 
                 holder.username,
                 grant,
             ),
+        );
+        // What launching the app records for the holder.
+        await server.services.permission.grantUserAppPermission(
+            holderActor,
+            app.uid,
+            'flag:app-is-authenticated',
         );
         const appActor = makeActor({
             user: holderActor.user,
@@ -9656,6 +9815,70 @@ describe('AuthController grant/revoke additional branches', () => {
                 makeRes(),
             ),
         ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('revoke-user-app: 400 on `deleteData` without "*" or as a non-boolean', async () => {
+        const { actor } = await makeUserAndActor();
+        const app = await server.stores.app.create(
+            {
+                name: `tr-delete-data-${uuidv4()}`,
+                title: 'TestDeleteDataApp',
+                index_url: `https://tr-delete-data-${uuidv4()}.example.test/`,
+            },
+            { ownerUserId: actor.user.id },
+        );
+        for (const body of [
+            { permission: 'events:background', deleteData: true },
+            { permission: '*', deleteData: 'yes' },
+        ]) {
+            await expect(
+                controller.handleRevokeUserApp(
+                    makeReq({ app_uid: app.uid, ...body }, { actor }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+    });
+
+    it('revoke-user-app `*`: announces the uninstall, with `deleteData` as sent', async () => {
+        const { actor } = await makeUserAndActor();
+        const app = await server.stores.app.create(
+            {
+                name: `tr-uninstall-${uuidv4()}`,
+                title: 'TestUninstallApp',
+                index_url: `https://tr-uninstall-${uuidv4()}.example.test/`,
+            },
+            { ownerUserId: actor.user.id },
+        );
+        const seen: unknown[] = [];
+        const listener = (_key: string, data: unknown) => {
+            seen.push(data);
+        };
+        server.clients.event.on('app.uninstalled', listener);
+        try {
+            for (const deleteData of [undefined, true]) {
+                await inCtx(actor, () =>
+                    controller.handleRevokeUserApp(
+                        makeReq(
+                            { app_uid: app.uid, permission: '*', deleteData },
+                            { actor },
+                        ),
+                        makeRes(),
+                    ),
+                );
+            }
+        } finally {
+            server.clients.event.off('app.uninstalled', listener);
+        }
+        const expected = {
+            userId: actor.user.id,
+            userUuid: actor.user.uuid,
+            appUid: app.uid,
+        };
+        expect(seen).toEqual([
+            { ...expected, deleteData: false },
+            { ...expected, deleteData: true },
+        ]);
     });
 
     it('revoke-user-app: 400 when permission is "*" but app_uid is missing', async () => {

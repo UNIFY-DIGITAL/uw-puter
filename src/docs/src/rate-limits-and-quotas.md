@@ -77,6 +77,8 @@ An input over its limit is rejected before it reaches the model, as is an image 
 
 The standard chat timeout is 10 minutes for a response to start, or to finish if it isn't streamed. Stream durations depend on the provider. Native Gemini applies the 10-minute timeout to the whole response, including streaming. Groq uses 60 seconds to start a response. Mistral streams have no timeout of their own. If the caller disconnects, a stream that's still running gets 10 more minutes to finish, and is then stopped. See the [AI model directory](https://developer.puter.com/ai/models/) for model specifications.
 
+GPT-6.1 Terra has a 1,050,000-token context window and a maximum output of 128,000 tokens. Requests with more than 272,000 input tokens are charged at twice the input and cache rates and 1.5 times the output rate for the whole request.
+
 A `gemini-4-argon` response that isn't streamed is capped at 32,768 output tokens, and a larger `max_tokens` is lowered to that cap. Streaming uses the model-directory limit.
 
 Text-to-speech calls to ElevenLabs, xAI, Speechify, Kling and Gemini time out after 2 minutes; xAI speech-to-text and voice-changer calls after 10 minutes, upload included. A call that times out before any audio or transcript comes back fails with `504 upstream_timeout`. For Gemini, the 2 minutes cover the whole reply, audio included.
@@ -89,7 +91,62 @@ Gemini speech-to-text first counts the audio's tokens, which times out after 30 
 
 The OpenAI- and Anthropic-compatible endpoints (`/puterai/openai/v1/*`, `/puterai/anthropic/v1/messages`) require a paid plan; a free account gets `402 subscription_required`. The same models are available to every account through `puter.ai.*` and `/drivers/call`, and the model catalogue endpoints are open to everyone.
 
+Realtime sessions ([`puter.ai.convo()`](/AI/convo/), `/puterai/openai/v1/realtime`) require a paid plan, like the other OpenAI-compatible endpoints, and are capped at 20 open at once per account. An account without a plan gets an `error` event with code `subscription_required`. A session over the cap gets `rate_limit_exceeded`. Both close with 1008.
+
+| Realtime transport limit | Value | Behavior at the limit |
+| --- | --- | --- |
+| Client JSON message size | 64 KiB, including reassembled fragments | Close 1009. |
+| Upstream JSON message size | 4 MiB, including reassembled fragments | Close 1011. A response that hasn't reported its usage is billed the credit held for it. |
+| Fragments per client message | 64 | Connection closes. |
+| Buffered receive chunks from the client | 128 | Connection closes. |
+| Event type length | 1–128 characters | Invalid client envelopes receive `invalid_event` and close with 1008. Invalid upstream envelopes close with 1011. |
+| Client message rate | 100/s, burst 100 | Error `rate_limit_exceeded`, close 1008. Ping and pong frames count toward this allowance. |
+| Client upload rate | 128 KiB/s, burst 64 KiB | Reads pause to refill the budget. More than 64 KiB of overdraft closes with `rate_limit_exceeded`. |
+| Input pending session setup | 32 messages or 64 KiB | Error `rate_limit_exceeded`, close 1008. |
+| Forwarding queue in either direction | Reads pause at 128 KiB. Admission stops above 192 KiB toward the provider and above 4 MiB plus 128 KiB toward the client. | A full queue closes with `rate_limit_exceeded`. |
+| Client that stops reading | 30 seconds of paused upstream reads | Close 1008. |
+| Pending usage records | 32 | Error `rate_limit_exceeded`, close 1008. Records already received are still billed. |
+| Numeric usage fields | Finite, nonnegative, at most 1 billion | Invalid upstream usage closes with 1011. A `null` usage counts as none. |
+| Session setup timeout | 15 seconds | Error `connection_timeout`, close 1011. |
+| Upstream handshake timeout | 10 seconds | Close 1011. |
+| Heartbeat interval | 30 seconds | A missing pong terminates the connection on the next heartbeat. |
+| Credential cache and recheck | Cache 60 seconds, sweep every 15 seconds, at most 16 checks in parallel | Invalid credentials close with 1008. Overlapping sweeps are skipped. |
+| Session attempts per credential | 60 per minute | Error `rate_limit_exceeded`, close 1008. |
+| Credit held per response | 8,000 audio input and 4,096 audio output tokens at the session model's rates, held until the response's usage is recorded | A session opens only if the account can cover one hold. A response the account can't cover gets `insufficient_funds`, close 1008, and is billed for what it generated. A response whose usage never arrives because the provider connection closed first is billed the full hold. |
+| Restart notice (`puter.reconnect`) | At most once a minute per session | Repeated announcements within the minute aren't sent. |
+| In-flight response drain at shutdown | 5 seconds | Close 1012. |
+| Billing a response after the client disconnects | 5 seconds | The response is cancelled and billed for what it generated, including one that was requested but starts only after the disconnect. A response that doesn't report its usage within the 5 seconds is billed the credit held for it. |
+
+Send audio as a stream of small chunks. The message cap applies to text, configuration, tool output, and audio alike.
+
+The [`puter.ai.convo()`](/AI/convo/) SDK also applies these limits before sending or retaining data.
+
+| Conversation SDK limit | Value | Behavior at the limit |
+| --- | --- | --- |
+| Text per helper call | 8192 characters | Throws `input_too_large`. |
+| Instructions | 8192 characters | Rejects with `invalid_argument`. |
+| Voice identifier | 128 characters | Rejects with `invalid_argument`. |
+| PCM chunk | 12000 samples at 24 kHz, or 500 ms | Throws `input_too_large`. |
+| Native JSON traversal | Depth 16, 2048 visited values, 2048 array entries or object fields | Throws `input_too_large` before serialization. |
+| Outbound buffered data | 128 KiB for audio, 192 KiB for other events | Throws `queue_full`. The built-in microphone drops the chunk instead. |
+| Pending acknowledgments | 8 | Rejects with `operation_in_progress`. |
+| Concurrent configuration updates | 1 | Rejects with `operation_in_progress`. |
+| Authentication and provider acknowledgment timeout | 10 seconds | Rejects preparation or the pending operation. |
+| Session creation timeout | 20 seconds | Rejects `connect()` with `operation_timeout`. |
+| Browser media initialization timeout | 10 seconds, not counting the permission prompt | Rejects with `media_timeout` and releases resources. |
+| Capture chunk duration | 20 ms | AudioWorklet sends 480 PCM16 samples per chunk. |
+| Unacknowledged capture chunks | 25, or 500 ms | Further chunks are dropped until the page catches up. |
+| Queued playback | 300 seconds | Further audio for the reply is dropped and `queue_full` is reported once. |
+| Reconnection attempts | 10, backing off from 500 ms to 10 seconds, each delay randomized between half and one and a half times its value | The conversation closes with the original close code. |
+| Replacement session after a restart notice | Opened within 3 seconds of the notice, then retried from 1 second, backing off to 10 seconds, each delay randomized between half and one and a half times its value. Settings on a held replacement are acknowledged within 3 seconds. | The current session keeps working until the conversation switches or the server closes it. A refusal that retrying can't fix stops the attempts. |
+| Offline wait while reconnecting | 2 minutes per reconnection, in browsers that report being offline | Attempts continue after the wait. |
+| Context restored after a reconnection | The 40 most recent restorable items, 48 KiB in total | Older items are left out. |
+| Remembered canceled responses | 32 | Older response IDs are evicted from the suppression set. |
+
+
 `/puterai/anthropic/v1/messages/count_tokens` has its own budget of 120 requests per minute per user, with no concurrency limit, and is not charged.
+
+Chat requests accept JSON bodies up to 128 MiB (134,217,728 bytes), including `text/plain;actually=json` bodies. That covers `puter-chat-completion` calls through `/drivers/call`, which `puter.ai.chat()` uses, and POSTs to `/puterai/openai/v1/*`, `/puterai/anthropic/v1/messages` and `/puterai/anthropic/v1/messages/count_tokens`. A body over 50 MiB needs a `Content-Length` header and a token in the `Authorization` or `x-api-key` header (or a session cookie); an `auth_token` inside the body isn't read until the body is, so it only works up to 50 MiB. Larger bodies, and bodies over 50 MiB for other drivers, return HTTP 413. One account can have up to 128 MiB of these large bodies in flight at once; past that, requests get `429` with `Retry-After`. A server handling too many large bodies at once returns `503` with `Retry-After`. Retry either after the given number of seconds. Other routes accept JSON bodies up to 50 MiB.
 
 Claude's server-executed tools are clamped so a request can't reserve an unbounded amount of credit:
 
@@ -186,12 +243,16 @@ Before the provider runs, the balance must cover every page the call can be bill
 
 ### Key-value store
 
+<div class="info">KV sharing is in beta. Method shapes, limits, and behavior may change between releases.</div>
+
 | Limit                           | Paid | Free | Anonymous |
 | ------------------------------- | ---- | ---- | --------- |
 | `get` / `set` / etc. per 10 s   | 400  | 400  | 200       |
 | `list` (prefix scan) per minute | 240  | 120  | 60        |
 | Concurrent calls                | 30   | 15   | 8         |
 | Concurrent `list`               | 5    | 3    | 2         |
+
+Calls through [share handles](/KV/share/) into one user's data for one app also spend a budget that every holder of those shares draws from, the same on every plan. All the holders together can spend 15,000 units per 10 seconds, and one holder at most 3,750 of them, so one busy holder can't use up the budget for the others. The budget counts storage use, so large entries and big listings spend more. A read spends about 1 unit for every 8 KB read, with each entry rounded up to 4 KB. A write spends 3 units for every 1 KB of each entry written. Every call spends at least 1 unit. So a `get()` of a small entry spends 1 unit, a `set()` of a value up to 1 KB spends 3, and a `list()` page that reads 1 MB spends 128. Past the holder's part or the total, calls through those shares fail with `too_many_requests` until older calls leave the 10-second window. The owner's own calls don't count, with or without a handle. How many shares an account can make and hold is listed under [Events](#what-an-account-can-hold).
 
 Sizes are the same for every account:
 
@@ -200,7 +261,7 @@ Sizes are the same for every account:
 | Key                       | 1 KB                                      |
 | Key, through a share handle | 768 bytes (UTF-8)                       |
 | `list()` pattern, through a share handle | 768 bytes (UTF-8)            |
-| Value                     | 400 KB                                    |
+| Value                     | 399 KB (408,576 bytes)                    |
 | Any number inside a value | ±9,007,199,254,740,991 (2<sup>53</sup>−1) |
 | Path nesting (`add`/`update`/`incr`/`decr`/`remove`) | 31 levels |
 | Path segments in one call, all paths together | 1,500 |
@@ -208,9 +269,9 @@ Sizes are the same for every account:
 
 A key or value over its size limit is rejected. A key you pass with a share handle is relative to the handle, and its 768-byte limit stays the same whatever the length of the shared prefix. An empty key or a longer one is refused with `kv_handle_key_invalid`, and so is a longer `list()` pattern.
 
-A number out of range is not rejected: it's stored clamped to the bound, and `NaN` is stored as `null` (as `JSON.stringify()` does). This applies at any depth inside an object or array. Store values that must stay exact past 2<sup>53</sup>, such as large ids or running totals, as strings.
+A number out of range isn't rejected. It's stored clamped to the bound, and `NaN` is stored as `null`, as `JSON.stringify()` does. This applies at any depth inside an object or array. Store values that must stay exact past 2<sup>53</sup>, such as large ids or running totals, as strings.
 
-A path such as `a.b.c` may chain at most 31 levels, and one call's paths at most 1,500 segments together. All of a call's paths go into one write of limited size, so in practice a call fits about 140 short paths (about 60 for `incr` and `decr`), fewer when the paths are long. A value nests at most 32 levels deep: the stored value is the first level, and each object or array inside it, or path segment above it, adds one, so `{ a: { b: 1 } }` stored with `set()` is 3 levels deep and written by `update()` at `x.y` is 5; `add()` counts the list it appends to as one more. Past any of these, the call rejects with `bad_request`.
+A path such as `a.b.c` may chain at most 31 levels, and one call's paths at most 1,500 segments together. All of a call's paths go into one write of limited size, so in practice a call fits about 140 short paths (about 60 for `incr` and `decr`), fewer when the paths are long. A value nests at most 32 levels deep. The stored value is the first level, and each object or array inside it, or path segment above it, adds one. So `{ a: { b: 1 } }` stored with `set()` is 3 levels deep, and written by `update()` at `x.y` it's 5. With `add()`, the list it appends to counts as one more level. Past any of these, the call rejects with `bad_request`.
 
 Each call is also capped, the same for every account:
 
@@ -260,6 +321,7 @@ Per minute unless stated:
 | Signed-URL reads | 3,000/min | Per network |
 | Signed-URL writes | 600/min | Per network |
 | Signed-URL concurrent requests | 60 | Per network |
+| Thumbnail read URLs | Valid for at least 6 days and 23 hours, refreshed hourly | Per URL |
 | `getReadURL()` (shared with all access-token creation) | 20/hour | |
 | `revokeReadURL()` | 60/min | |
 
@@ -368,10 +430,12 @@ Another user's profile is readable only while that user is on a paid plan. Owner
 
 ### Sharing
 
+These limits cover file sharing through [`puter.fs`](/FS/). KV shares are listed under [Key-value store](#key-value-store).
+
 | Limit                                                           | Value | Scope |
 | --------------------------------------------------------------- | ----- | ----- |
-| `share` / `revoke` calls                                        | 60/min, 500/day | |
-| Reads (`getShares`, `listShared`, `listSharedByMe`)             | 600/min | |
+| [`fs.share()`](/FS/share/) / [`fs.unshare()`](/FS/unshare/) calls | 60/min, 500/day | |
+| Reads ([`fs.getShares()`](/FS/getShares/), [`fs.listShared()`](/FS/listShared/), [`fs.listSharedByMe()`](/FS/listSharedByMe/)) | 600/min | |
 | New shares                                                      | 200/day | Per user, all apps |
 | Recipients per request                                          | 10 | |
 | Items per request                                               | 50 | |
@@ -390,6 +454,48 @@ The notification and email that tell a recipient about a share have their own li
 Over these, **the share still succeeds**; only the announcement is skipped. The recipient's notification still updates and groups senders ("alice and bob shared 5 items with you"). Emails triggered for one recipient within 5 seconds are sent as one digest.
 
 Recipients can opt out of share email with the link in the email, and a deployment can turn it off with `share_email_notifications: false`. Recipients can also block shares from one sender or from everyone (**Settings → Security → Blocked people**); the sender's `share` then fails with `recipient_not_accepting_shares`.
+
+### Notifications
+
+An app, its workers and the tokens it issues can send `app.message` notifications to the user they act for, and to the other side of a [KV share](/KV/share/) made with `notify: true`. Each app has its own budget per recipient:
+
+| Limit                             | Value                             | Scope             |
+| --------------------------------- | --------------------------------- | ----------------- |
+| `app.message` notifications       | 30/min, 1,000/day                 | Per user, per app |
+| Pushes                            | 12/min, 1,000/day                 | Per user, per app |
+| Pushes from a new or unlisted app | 6/min, 200/day                    | Per user, per app |
+| Notifications through a [KV share](/KV/share/) | 30/min, 500/day       | Per sender, recipient and app |
+| Browsers with pushes turned on    | 10 per app, 20 for Puter          | Per user          |
+| Turning pushes on in a browser    | 10/min                            | Per user          |
+| Confirmation pushes               | 5/hour                            | Per browser       |
+| `title`                           | 120 characters                    |                   |
+| `text`                            | 240 characters                    |                   |
+| `icon` (an `https` URL)           | 2,048 characters                  |                   |
+| `target` (a path inside the app)  | 512 characters                    |                   |
+| `data`                            | 1 KiB, measured as JSON           |                   |
+| `group`                           | 128 characters                    |                   |
+| `channel`                         | 32 characters                     |                   |
+| `ttl`                             | 1 second to 1 day, default 1 hour |                   |
+
+Characters are counted as Unicode code points, so most emoji count as one. A notification's `ttl` is how long a push service keeps trying to reach an offline device, not how long the notification is kept. A value over any size limit, or with a field the format doesn't have, fails with `400 bad_request`.
+
+The notification limits count notifications written. A notification that replaces the app's earlier one with the same `group` counts against the per-minute limit only, not the per-day limit. [`notify()`](/Notifications/notify/#groups) says when a notification replaces one. Over a limit, the call fails with `429 too_many_requests`, and a refused call counts against neither window. A deployment can change these two limits with `notificationAppMessageLimits: { perMinute, perDay }`.
+
+Notifications one side of a KV share sends the other through its handle count against the recipient's `app.message` limits, and also against the limit for that sender, recipient and app, across all their shares in that app. Over either one, the call fails with the same error, so the sender can't tell which limit it hit. A call that the recipient's limits refuse still counts against the share limit. The pushes count against the recipient's push limits and are billed to the recipient.
+
+A notification goes out as a push only when no open page of the app answers within 5 seconds that it's visible and focused, or that it shows the notification itself. The push limits count only pushes sent, and a replacement that goes out as a push counts like any other. An app gets the lower push limits while it's younger than 30 days or not approved for listing. A website using Puter.js starts out unlisted, so it gets the lower limits. Over a push limit, the call still succeeds and the notification still reaches the app live, but it isn't pushed.
+
+A push carries about 4 KB, and one that doesn't fit has its text shortened. Turning pushes on in another browser past an app's 10 removes that app's least recently seen one. A browser that goes 60 days without receiving a push or renewing its registration stops getting pushes. A page that calls [`onPush()`](/Notifications/onPush/) renews it on load.
+
+#### What pushes cost
+
+A push an app sends with [`puter.notifications.notify()`](/Notifications/notify/) is billed to the user who receives it:
+
+| What                        | Rate                       | Counted per                   |
+| --------------------------- | -------------------------- | ----------------------------- |
+| A push from an app          | 250 µ¢ ($2.50 per million) | Device that received the push |
+
+A push to three of the user's devices counts three times. A push that didn't reach a device isn't charged. A user with no usage credit left gets no pushes from apps until they top up. Puter's own notifications, such as a share or a finished deploy, are free.
 
 ### Teams
 
@@ -418,25 +524,32 @@ The mutation and read budgets are per user, per app, not per team: administering
 
 ### Events
 
-See [Events](/Events/) for an overview, [`onLocal()`](/Events/subjects/#gaps) for gap markers, and [`onPersistent()`](/Events/onPersistent/#suspended-subscriptions) for suspension.
+See [Events](/Events/) for an overview, [Gaps](/Events/subjects/#gaps) for gap markers, and [Suspended subscriptions](/Events/onPersistent/#suspended-subscriptions) for suspension.
 
 #### What an account can hold
+
+<div class="info">KV sharing is in beta. Method shapes, limits, and behavior may change between releases.</div>
 
 | Limit                                | Scope              | Paid | Free | Anonymous |
 | ------------------------------------ | ------------------ | ---- | ---- | --------- |
 | Persistent subscriptions             | Per user, all apps | 500  | 100  | 0         |
 | Persistent subscriptions             | Per user, per app  | 100  | 25   | 0         |
-| KV share handles                     | Per user, all apps | 512  | 200  | 0         |
-| KV share handles                     | Per user, per app  | 512  | 128  | 0         |
+| KV share handles                     | Per user, all apps | 25,000 | 5,000 | 0       |
+| KV share handles                     | Per user, per app  | 10,000 | 2,000 | 0       |
+| KV share handles with one other user | Per owner and holder | 256  | 256  | 0         |
 | Session subscriptions                | Per connection     | 50   | 50   | 50        |
+| Session subscriptions through one KV share handle | Per holder, all connections | 1,000 | 1,000 | 1,000 |
 
-- Over a subscription limit: `events_subscription_limit`. Over a share-handle limit: `events_kv_handle_limit_reached`.
+- A subscription over its limit fails with `events_subscription_limit`, and a share handle over its limit with `events_kv_handle_limit_reached`.
+- Session subscriptions through a share handle also count toward the limit per connection. The limit through one handle counts the holder's subscriptions in one region, including ones on connections that dropped and haven't been cleaned up yet. The owner's own subscriptions through the handle don't count.
 - Anonymous accounts get `events_durable_requires_account` for persistent subscriptions and `events_kv_handle_requires_account` for share handles.
-- Unsubscribing or revoking frees a slot immediately. Revoked handles stay listed but don't count.
+- Unsubscribing or revoking frees a slot immediately. Revoked handles don't count. They stay in [`puter.kv.listSharedByMe()`](/KV/listSharedByMe/) for 30 days after they stop, and are then deleted.
+- A persistent subscription [suspended](/Events/onPersistent/#suspended-subscriptions) with `permission_revoked` doesn't count toward the persistent subscription limits, since it never resumes. One suspended for any other reason still counts.
+- A [`puter.kv.share()`](/KV/share/) call with several recipients is refused as a whole with `events_kv_handle_limit_reached` when its new shares would go over the all-apps or per-app limit. Sharing a prefix again with a user who already has it takes no slot. The limit per holder applies to each recipient on its own, and a recipient over it gets the error on their own item.
 - A share handle minted without naming an app counts only toward the all-apps limit.
 - A share's key prefix has a length limit that depends on the app's uid and the access level. For an app uid of the usual form, `app-` and a uuid, the prefix without its trailing `:` can be at most 168 characters for `watch`, 163 for `read`, and 162 for `write`. In the store that belongs to no app, it can be at most 199, 194, and 193. A longer prefix is refused with `invalid_kv_share_prefix`.
 - The consent an app asks for with [`puter.perms.request('kvShare', …)`](/Perms/request/) names a prefix too. Its limit is 7 characters lower, so 161, 156, and 155 for an app uid of the usual form.
-- Calls through a share handle read the handle from a cache that keeps it for up to 60 seconds. When a share stops while a wider share of the same holder still covers its keys, calls through the stopped handle can keep working for up to 60 seconds. Without a wider share, access ends right away.
+- When a share stops while a wider share of the same holder still covers its keys, calls through the stopped handle can keep working for up to 60 seconds. Without a wider share, access ends right away.
 - A share's label may be at most 128 characters and 512 bytes (UTF-8), with at most 3 combining marks on one character. A longer label is refused with `kv_share_label_invalid`.
 
 #### How many subscriptions one event reaches
@@ -450,9 +563,10 @@ Counted per event, per region:
 
 - KV limits follow the plan of the **key's owner**, not the writer's or the subscribers'. If the owner's plan can't be looked up, the free numbers apply. A server with no metering uses the paid numbers.
 - They count subscriptions, not people. A user with three tabs open counts three times.
-- Past the limit, the next subscriptions get a [gap marker](/Events/subjects/#gaps) instead of the event (up to the same number again), and any after that get nothing. With 1,100 subscriptions on a paid owner's key: 512 get the event, 512 get a gap, 76 get nothing.
+- Subscriptions are counted with those of the owner of the key or file first, then the other users' subscriptions taking turns, one per user per round. Each change starts the turns at a random user. So one user with many subscriptions can't use up the limits for everyone else.
+- Past the limit, the next subscriptions get a [gap marker](/Events/subjects/#gaps) instead of the event (up to the same number again), and any after that get nothing. With 1,100 subscriptions on a paid owner's key, 512 get the event, 512 get a gap, and 76 get nothing.
 - The region that handles the write delivers to every persistent subscription plus its own connected clients. Other regions deliver only to their own connected clients. So persistent subscriptions share one budget per event, while session subscriptions spread across regions can reach more in total.
-- `includeValue` values are left out of every delivery for a change when more than **128** subscriptions match it (whatever the owner's plan), when the filter-check limit stops the count early, or when the value is over **16 KB**.
+- Values asked for with `includeValue` go out on the first **128** deliveries of a change that asked for them, in the order above and whatever the owner's plan. Later deliveries carry the key without the value, and so does every delivery when the value is over **16 KB**.
 
 #### Call budgets
 
@@ -462,6 +576,8 @@ Counted per event, per region:
 | `unsubscribe`                                     | 600/min  | Per user, all apps |
 | Acknowledgements                                  | 600/min  | Per user, all apps |
 | Share-handle mint / revoke                        | 60/min   | Per user, all apps |
+| New recipients of `kv.share()`                    | 300/min, 2,000/hour | Per user, all apps |
+| Recipients named in `kv.share()`                  | 1,200/min | Per user, all apps |
 | `kv.share.received` notifications                 | 5/hour   | Per owner and holder |
 | Handler publish / remove                          | 60/min   | Per user, all apps |
 | Subscription and share-handle listings (combined) | 120/min  | Per user, per app  |
@@ -469,25 +585,27 @@ Counted per event, per region:
 | Events worker listings                            | 120/min  | Per user, per app  |
 | `fetch()`                                         | 120/min  | Per user, per app  |
 
-Over any of these: `too_many_requests`, except `kv.share.received` notifications: a share past that limit is still made, and the holder isn't notified about it. Listing pages hold up to 200 items. A `fetch()` page defaults to 50 events and holds up to 200.
+Calls over any of these fail with `too_many_requests`. A share over the `kv.share.received` limit is still made, without notifying the holder. Listing pages hold up to 200 items, and a `fetch()` page defaults to 50 events and holds up to 200.
 
-Unsubscribing counts toward its own `unsubscribe` limit, not the `subscribe` one.
+A [`puter.kv.share()`](/KV/share/) call names 1 to 50 recipients, and each one counts toward the named-recipient limit. A recipient who doesn't already have the share also counts toward the new-recipient limit, including a username that doesn't exist and a user the share is refused for. The call counts once toward the mint limit when it makes a share, changes one, or has any recipient who counts as new. A call where every recipient already has the share at the same access level and label counts only toward the named-recipient limit. When the recipients don't all fit in a limit, the whole call fails with `too_many_requests`, and the part that did fit still counts.
+
+Unsubscribing counts toward its own `unsubscribe` limit, not the `subscribe` one. Changing a subscription's context with [`puter.events.update()`](/Events/update/) counts toward the `subscribe` limit.
 
 #### Delivery
 
 | Limit                                    | Value      | Scope                  |
 | ---------------------------------------- | ---------- | ---------------------- |
-| Broadcast deliveries                     | 600/min    | Per subscription       |
-| `single` deliveries                      | 120/min    | Per subscription       |
+| Deliveries without `queue`               | 600/min    | Per subscription       |
+| `queue` deliveries                       | 120/min    | Per subscription       |
 | Handler runs                             | 60/min     | Per user, per app      |
 | Coalescing window                        | 250 ms     | Per subscription and subject |
-| Time to acknowledge a `single` delivery  | 60 seconds | Per delivery           |
+| Time for a client to answer a `queue` delivery | 15 seconds | Per delivery     |
 | Undelivered backlog                      | 10,000     | Per subscription       |
 | Undelivered backlog                      | 1,000,000  | Per region             |
 | KV value inlined in a delivery           | 16 KB      | Per delivery           |
 
 - Over a delivery rate, the event is replaced by a gap marker (`delivery_rate_limit`).
-- Over the handler-run rate, a `single` delivery waits and goes out later, and a `broadcast` one runs only in connected clients. Neither counts as a handler failure.
+- Over the handler-run rate, a `queue` delivery waits and goes out later, and any other delivery runs only in connected clients. Neither counts as a handler failure.
 - When a backlog is full, the oldest deliveries are dropped and replaced by one gap marker (`backlog_overflow`).
 
 #### Handlers
@@ -500,11 +618,13 @@ Unsubscribing counts toward its own `unsubscribe` limit, not the `subscribe` one
 | Handlers per `publishAll()` call       | 50                             | Per call           |
 | Events worker deploys                  | 30/hour                        | Per app, all users |
 | Run timeout                            | 30 seconds                     | Per run            |
-| Retry delay                            | 2 seconds, doubling, up to 5 minutes | Per delivery |
+| Retry delay (`queue`, temporary errors) | 2 seconds, doubling, up to 5 minutes | Per delivery |
 | Failures in a row before suspension    | 5                              | Per subscription   |
 | `user` token lifetime in the events worker | 15 minutes                 | Per run            |
 
-Failures count as in a row until the handler takes a delivery or an hour passes without another failure; either resets the count to zero.
+Failures count as in a row until the handler takes a delivery or an hour passes without another failure. Either one resets the count to zero.
+
+Only the handler's own failures count, including a run past the 30-second timeout. A run in the events worker that Puter couldn't start or finish, or that threw after a Puter API call from `user` got a `5xx`, a `429`, or a network error, is retried on the same delay schedule and doesn't count. When Puter's answer names a longer wait (`Retry-After`), the retry waits that long, up to 5 minutes. Puter's own failures never suspend a subscription, and the events it holds while retrying stay within the backlog limits above.
 
 Over the deploy limit, deliveries stay queued and retry after the hour rolls over.
 
@@ -514,8 +634,8 @@ Over the deploy limit, deliveries stay queued and retry after the hour rolls ove
 | ----------------------------- | ------------------------------ | ---- | ---- |
 | Handler runs in one chain     | Per account holding the subscription | 12 | 4 |
 
-- A write made through a handler's `user` in the events worker, or through a token `user` creates, is one run deeper than the event that ran the handler. Writes from anywhere else start a new chain. `user.workers.create` is refused rather than counted — a handler cannot start an untracked chain through a worker of its own.
-- When an event reaches the limit, the events worker runs no handler for it. A `broadcast` one still reaches connected clients without running the persistent handler; a `single` one is still offered to a connected client first and runs there. The dropped run leaves no gap marker and doesn't count as a handler failure.
+- A write made through a handler's `user` in the events worker, or through a token `user` creates, is one run deeper than the event that ran the handler. Writes from anywhere else start a new chain. A handler can't start a chain outside this count through a worker of its own, since `user.workers.create` is refused.
+- When an event reaches the limit, the events worker runs no handler for it. Without `queue`, it still reaches connected clients without running the persistent handler. A queued one is still offered to a connected client first and runs there. The dropped run leaves no gap marker and doesn't count as a handler failure.
 - If the holder's plan can't be looked up, the free number applies. A server with no metering uses the paid number.
 
 #### Suspended subscriptions
@@ -523,8 +643,9 @@ Over the deploy limit, deliveries stay queued and retry after the hour rolls ove
 | Limit                              | Value |
 | ---------------------------------- | ----- |
 | Backlog kept                       | 100 deliveries |
-| How long the backlog is kept       | 24 hours for `handler_not_found` and `failures`; 1 hour for `no_credit`; dropped immediately for `permission_revoked` |
+| How long the backlog is kept       | 24 hours for `handler_not_found` and `failures`, 1 hour for `no_credit`. A `permission_revoked` backlog is dropped right away. |
 | Suspended subscription deleted after | 30 days |
+| Subscriptions suspended with `permission_revoked` kept | 500 per account. Past that, subscribing again deletes the oldest ones. |
 
 When a kept backlog expires, it's replaced by one gap marker (`suspended_backlog_expired`).
 
@@ -533,11 +654,11 @@ When a kept backlog expires, it's replaced by one gap marker (`suspended_backlog
 | Limit                                    | Value |
 | ---------------------------------------- | ----- |
 | Subject length                           | 4,096 characters |
-| Match pattern                            | 256 characters and 16 segments; one `*` per segment, one `**` in total |
-| KV key indexed on                        | The first 6 `:`-segments or 160 bytes, whichever is shorter; the rest is matched as a pattern |
+| Match pattern                            | 256 characters, 16 segments, one `*` per segment, and one `**` in total. Through a KV share handle, the 256 characters are counted after the handle |
+| KV key indexed on                        | The first 6 `:`-segments or 160 bytes, whichever is shorter. The rest is matched as a pattern |
 | `context` on a persistent subscription   | 4 KB |
 
-Over a pattern limit: `invalid_subject_pattern`. Over the context limit: `events_context_too_large`.
+A pattern over its limits fails with `invalid_subject_pattern`, and a context over 4 KB with `events_context_too_large`.
 
 #### What events cost
 
@@ -548,9 +669,9 @@ Deliveries are billed to the account holding the subscription:
 | `events:delivery:broadcast` | 10 µ¢ ($0.10 per million)  | Delivered event |
 | `events:delivery:single`    | 100 µ¢ ($1 per million)    | Delivered event |
 
-µ¢ is a microcent (a millionth of a cent). Session subscriptions bill at the broadcast rate. Handler runs bill separately as worker usage.
+µ¢ is a microcent (a millionth of a cent). Deliveries for `queue` subscriptions bill on the `single` line, and every other delivery, session subscriptions included, bills at the broadcast rate. Handler runs bill separately as worker usage.
 
-Free: idle subscriptions, events a filter excluded, writes merged by coalescing, deliveries stopped by a permission check, deliveries with no client connected to receive them and no handler run, and gap markers.
+Nothing is billed for idle subscriptions, events a filter excluded, writes merged by coalescing, deliveries stopped by a permission check, deliveries with no client connected to receive them and no handler run, `queue` deliveries still waiting to reach a client or a handler, retries (a `queue` event bills once however many attempts it takes), and gap markers.
 
 When the holder's balance runs out, deliveries stop and persistent subscriptions are suspended with `no_credit`, and the holder is notified. The backlog is kept for 1 hour. Topping up resumes them within a few minutes.
 

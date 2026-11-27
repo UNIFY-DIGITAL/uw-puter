@@ -2,11 +2,7 @@ import * as utils from '../lib/utils.js';
 import { fetchUrl } from '../lib/networkUtils.js';
 import { PuterModule } from '../lib/PuterModule.js';
 import PuterDialog from './PuterDialog.js';
-import {
-    hasOpaqueOrigin,
-    hasUserActivation,
-    openAuthPopup,
-} from '../lib/auth-popup.js';
+import { hasOpaqueOrigin } from '../lib/auth-popup.js';
 
 /**
  * Puter user details, as returned by `getUser()`.
@@ -116,6 +112,9 @@ import {
  * are for apps that drive the sign-in flow themselves.
  */
 export class AuthModule extends PuterModule {
+    /** @internal */
+    pendingSignInMessageIds_ = new Set();
+
     /**
      * Signs the user in, opening a popup with the appropriate authentication
      * method. Must be called from a user gesture (such as a click) — without
@@ -164,6 +163,7 @@ export class AuthModule extends PuterModule {
         return new Promise((resolve, reject) => {
             const signinsession = crypto.randomUUID();
             const msg_id = signinsession;
+            this.pendingSignInMessageIds_.add(msg_id);
             const popupName = `Puter-sign-in-${signinsession}`;
             const url = `${puter.defaultGUIOrigin}/action/sign-in?embedded_in_popup=true&msg_id=${msg_id}${window.crossOriginIsolated ? `&cross_origin_isolated=true&signin_session=${signinsession}` : ''}${options.attempt_temp_user_creation ? '&attempt_temp_user_creation=true' : ''}${options.request_auth ? '&request_auth=true' : ''}`;
 
@@ -175,13 +175,29 @@ export class AuthModule extends PuterModule {
             // The auth popup window we opened. Pinned as the expected
             // `event.source` when validating the token message.
             let popupWindow = null;
+            let consentDialog = null;
 
             const cleanup = () => {
+                this.pendingSignInMessageIds_.delete(msg_id);
                 if (checkClosed) {
                     clearInterval(checkClosed);
                     checkClosed = null;
                 }
                 window.removeEventListener('message', messageHandler);
+                consentDialog?.remove();
+                consentDialog = null;
+            };
+
+            const notifyAuth = () => {
+                if (typeof puter.onAuth !== 'function') return;
+                void (async () => {
+                    try {
+                        const user = await puter.whoamiCache_;
+                        puter.onAuth(user ?? (await puter.getUser()));
+                    } catch (error) {
+                        console.error(error);
+                    }
+                })();
             };
 
             if (window.crossOriginIsolated) {
@@ -223,6 +239,7 @@ export class AuthModule extends PuterModule {
                                 settled = true;
                                 cleanup();
                                 puter.setAuthToken(auth_token);
+                                notifyAuth();
                                 resolve({ success: true, token: auth_token });
                                 return '';
                             }
@@ -262,12 +279,25 @@ export class AuthModule extends PuterModule {
                 if (e.data.success) {
                     // set the auth token
                     puter.setAuthToken(e.data.token);
+                    notifyAuth();
                     resolve(e.data);
                 } else {
                     reject(e.data);
                 }
             }
             window.addEventListener('message', messageHandler);
+
+            const rejectBlocked = () => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                cleanup();
+                reject({
+                    error: 'popup_blocked',
+                    msg: 'The sign-in popup was blocked by the browser.',
+                });
+            };
 
             // Once the popup exists, watch for the user closing it without
             // completing sign-in. `popup` is null if the browser blocked it.
@@ -276,12 +306,12 @@ export class AuthModule extends PuterModule {
                     return;
                 }
                 if (!popup) {
-                    settled = true;
-                    cleanup();
-                    reject({
-                        error: 'popup_blocked',
-                        msg: 'The sign-in popup was blocked by the browser.',
-                    });
+                    rejectBlocked();
+                    return;
+                }
+                // The /login/wait relay settles isolated pages; COOP makes
+                // `closed` read true while the user is still signing in.
+                if (window.crossOriginIsolated) {
                     return;
                 }
                 // Record the popup so messageHandler can pin event.source.
@@ -304,40 +334,28 @@ export class AuthModule extends PuterModule {
                 }, 100);
             };
 
-            if (hasUserActivation()) {
-                // A user gesture is active — open the popup immediately.
-                const popup = openAuthPopup(url, popupName);
-                if (!window.crossOriginIsolated) {
-                    // cannot watch in isolated mode
-                    watchPopup(popup);
-                }
-            } else {
-                // No user gesture: a popup opened now would be blocked by the
-                // browser. Show a consent dialog first; the popup is then
-                // opened from the user's click on that dialog, which provides
-                // the gesture the browser requires.
-                const dialog = new PuterDialog(
-                    () => {},
-                    () => {},
-                    {
-                        popupURL: url,
-                        popupName,
-                        onLaunch: (popup) => watchPopup(popup),
-                        onCancel: () => {
-                            if (settled) {
-                                return;
-                            }
-                            settled = true;
-                            cleanup();
-                            reject({
-                                error: 'auth_window_closed',
-                                msg: 'Authentication window was closed by the user without completing the process.',
-                            });
-                        },
+            // Opens the popup now under a user gesture, else from the consent
+            // dialog's Continue click, which supplies the gesture.
+            try {
+                consentDialog = PuterDialog.launch({
+                    popupURL: url,
+                    popupName,
+                    onLaunch: (popup) => watchPopup(popup),
+                    onCancel: () => {
+                        if (settled) {
+                            return;
+                        }
+                        settled = true;
+                        cleanup();
+                        reject({
+                            error: 'auth_window_closed',
+                            msg: 'Authentication window was closed by the user without completing the process.',
+                        });
                     },
-                );
-                document.body.appendChild(dialog);
-                dialog.open();
+                });
+            } catch {
+                // No popup and no dialog to collect a click from.
+                rejectBlocked();
             }
         });
     };
@@ -511,11 +529,14 @@ export class AuthModule extends PuterModule {
     }
 
     /**
-     * Signs the user out of this app by discarding its auth token.
+     * Signs the user out of this app by discarding its auth token. On a
+     * website, this browser's push subscription for the app is removed too.
      *
      * @type {() => void}
      */
     signOut = () => {
+        // Started first, so it still holds the token of the user leaving.
+        void puter.notifications?._forgetPush?.(puter.authToken);
         puter.resetAuthToken();
     };
 

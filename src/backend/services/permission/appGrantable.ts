@@ -30,7 +30,7 @@ import {
     APP_DATA_PERMISSION_PREFIX,
     type AppDataStore,
 } from './appDataScopes.js';
-import { MANAGE_PERM_PREFIX } from './consts.js';
+import { MANAGE_PERM_PREFIX, NOTIFICATIONS_PUSH_PERMISSION } from './consts.js';
 import { PermissionUtil } from './permissionUtil.js';
 
 const ACCESS_LEVELS = ['read', 'write'] as const;
@@ -41,8 +41,8 @@ type FsMode = (typeof FS_MODES)[number];
 
 /**
  * A permission a user may grant an app through the consent prompt, parsed. No
- * app-actor check reads `apps-of-user:<uuid>:read` or `subdomains-of-user`;
- * they stay grantable because apps already request them.
+ * app-actor check reads `apps-of-user:<uuid>:read`; it stays grantable because
+ * apps already request it. `SubdomainDriver` honors `subdomains-of-user`.
  */
 export type AppGrantablePermission =
     | { family: 'fs'; target: string; mode: FsMode }
@@ -62,7 +62,9 @@ export type AppGrantablePermission =
           appUid: string;
           segments: string[];
       }
-    | { family: 'backgroundEvents' };
+    | { family: 'backgroundEvents' }
+    | { family: 'pushNotifications' }
+    | { family: 'customDomains' };
 
 /** One component as it is written canonically: `\` as `\\`, `:` as `\C`. */
 const escapeComponent = (component: string): string =>
@@ -116,6 +118,13 @@ export const parseAppGrantablePermission = (
 ): AppGrantablePermission | null => {
     if (permission === 'events:background') {
         return { family: 'backgroundEvents' };
+    }
+    if (permission === NOTIFICATIONS_PUSH_PERMISSION) {
+        return { family: 'pushNotifications' };
+    }
+
+    if (permission === 'custom-domains:manage') {
+        return { family: 'customDomains' };
     }
 
     const parts = PermissionUtil.split(permission);

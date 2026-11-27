@@ -20,6 +20,7 @@
 import { randomUUID } from 'node:crypto';
 import {
     EVENTS_DURABLE_SUBSCRIPTIONS_MAX,
+    EVENTS_REVOKED_SUBSCRIPTIONS_KEPT,
     type TieredQuota,
 } from '../../controllers/events/limits.js';
 import { HttpError } from '../../core/http/HttpError.js';
@@ -36,14 +37,7 @@ import {
     EVENT_SUBSCRIPTION_WIDTHS,
 } from './columnWidths.js';
 import type { GenerationBump } from './EventSubscriptionStore.js';
-import {
-    isSubscriptionTarget,
-    SUBSCRIPTION_TARGETS,
-    targetsAllowedForDelivery,
-    type DurableSubscription,
-    type SubscriptionPermission,
-    type SubscriptionTarget,
-} from './types.js';
+import type { DurableSubscription, SubscriptionPermission } from './types.js';
 
 /**
  * Subscriptions that outlive the connection that made them.
@@ -94,7 +88,6 @@ export interface DurableSubscriptionInput {
     match: string | null;
     op: FsOp | null;
     delivery: DeliveryClass;
-    targets: SubscriptionTarget[];
     handlerName: string | null;
     context: string | null;
     permission: SubscriptionPermission;
@@ -142,6 +135,19 @@ export type SuspendedReason = (typeof SUSPENDED_REASONS)[number];
 export const isSuspendedReason = (value: unknown): value is SuspendedReason =>
     SUSPENDED_REASONS.includes(value as SuspendedReason);
 
+/**
+ * Reasons that never lift. A row suspended for one is kept only so its holder
+ * can list it, so it holds no quota slot.
+ */
+export const TERMINAL_SUSPENDED_REASONS: readonly SuspendedReason[] = [
+    'permission_revoked',
+];
+
+/** Rows suspended for good. The `?`s bind {@link TERMINAL_SUSPENDED_REASONS}. */
+const TERMINAL_CLAUSE =
+    '(`suspended_at` IS NOT NULL AND `suspended_reason` IN (' +
+    `${TERMINAL_SUSPENDED_REASONS.map(() => '?').join(', ')}))`;
+
 /** Where a row is moving to when its anchor is deleted under it. */
 export interface ReanchorInput {
     token: string;
@@ -161,27 +167,6 @@ const contextTooLarge = (): HttpError =>
         { legacyCode: 'events_context_too_large' },
     );
 
-const invalidTargets = (): HttpError =>
-    new HttpError(
-        400,
-        `targets must be a subset of ${SUBSCRIPTION_TARGETS.join(', ')}`,
-        { legacyCode: 'invalid_targets' },
-    );
-
-const pushOnSingle = (): HttpError =>
-    new HttpError(
-        400,
-        'A `single` subscription may not target `push`, and an app`s needs a `worker` target',
-        { legacyCode: 'invalid_targets' },
-    );
-
-const workerNeedsApp = (): HttpError =>
-    new HttpError(
-        400,
-        'A subscription with no app has no events worker to target',
-        { legacyCode: 'invalid_targets' },
-    );
-
 const quotaReached = (limit: number, scope: 'account' | 'app'): HttpError =>
     new HttpError(
         429,
@@ -190,6 +175,37 @@ const quotaReached = (limit: number, scope: 'account' | 'app'): HttpError =>
             : `An account may hold ${limit} durable subscriptions`,
         { legacyCode: 'events_subscription_limit' },
     );
+
+/** What one holder's rows add up to, as the quota reads them. */
+export interface DurableHolderCount {
+    /** Rows holding a slot: live, or suspended for a reason that lifts. */
+    total: number;
+    /** The part of `total` that is one app's. */
+    forApp: number;
+    /** Rows suspended for good, which hold no slot. */
+    terminal: number;
+}
+
+/**
+ * The refusal for a create whose holder is at a cap, or `null`. `own` is how
+ * many of the counted rows are this create's: none before its insert, one
+ * after.
+ */
+const quotaRefusal = (
+    input: DurableSubscriptionInput,
+    held: DurableHolderCount,
+    own: 0 | 1,
+): HttpError | null => {
+    const perUser = Math.min(
+        input.limits?.perUser ?? EVENTS_DURABLE_SUBSCRIPTIONS_MAX,
+        EVENTS_DURABLE_SUBSCRIPTIONS_MAX,
+    );
+    const perApp = input.limits?.perApp ?? perUser;
+    if (held.total - own >= perUser) return quotaReached(perUser, 'account');
+    if (input.appUid !== null && held.forApp - own >= perApp)
+        return quotaReached(perApp, 'app');
+    return null;
+};
 
 /**
  * The quota refusal for a create that concurrent creates beat to the last slot
@@ -218,23 +234,11 @@ const asNumber = (value: unknown): number | null => {
 };
 
 /**
- * `targets` is a JSON column on mysql and postgres and text on sqlite, so the
- * driver hands back either an array or the string it was stored as.
+ * The `targets` column predates delivery to every transport. Nothing reads it;
+ * it is written with what older servers expect for this row.
  */
-const parseTargets = (value: unknown): SubscriptionTarget[] => {
-    const raw =
-        typeof value === 'string'
-            ? (() => {
-                  try {
-                      return JSON.parse(value) as unknown;
-                  } catch {
-                      return [];
-                  }
-              })()
-            : value;
-    if (!Array.isArray(raw)) return [];
-    return raw.filter(isSubscriptionTarget);
-};
+const legacyTargets = (appUid: string | null): string =>
+    JSON.stringify(appUid === null ? ['socket'] : ['socket', 'worker']);
 
 const toRow = (row: Record<string, unknown>): DurableSubscription => ({
     durable: true,
@@ -255,8 +259,7 @@ const toRow = (row: Record<string, unknown>): DurableSubscription => ({
             ? null
             : String(row.app_uid),
     permission: String(row.permission),
-    delivery: String(row.delivery) as DeliveryClass,
-    targets: parseTargets(row.targets),
+    delivery: row.delivery === 'single' ? 'single' : 'broadcast',
     handlerName:
         row.handler_name === null || row.handler_name === undefined
             ? null
@@ -278,7 +281,7 @@ const toRow = (row: Record<string, unknown>): DurableSubscription => ({
 const SELECT_COLUMNS =
     '`id`, `sub_id`, `token`, `owner_user_id`, `holder_user_id`, `app_uid`, ' +
     '`subject`, `anchor_uid`, `anchor_path`, `match`, `delivery`, `ops`, ' +
-    '`handler_name`, `targets`, `context`, `permission`, `include_value`, ' +
+    '`handler_name`, `context`, `permission`, `include_value`, ' +
     '`suspended_at`, `suspended_reason`, `expires_at`, `created_at`';
 
 export class DurableSubscriptionStore extends PuterStore {
@@ -292,11 +295,6 @@ export class DurableSubscriptionStore extends PuterStore {
     async create(
         input: DurableSubscriptionInput,
     ): Promise<{ row: DurableSubscription; bump: GenerationBump }> {
-        const targets = this.#assertTargets(
-            input.delivery,
-            input.targets,
-            input.appUid,
-        );
         this.#assertContext(input.context);
         assertColumnWidths(EVENT_SUBSCRIPTION_WIDTHS, {
             token: input.token,
@@ -309,7 +307,11 @@ export class DurableSubscriptionStore extends PuterStore {
             permission: input.permission,
         });
 
-        const refusal = await this.#overQuota(input, 0);
+        const refusal = quotaRefusal(
+            input,
+            await this.countForHolder(input.holderUserId, input.appUid),
+            0,
+        );
         if (refusal) throw refusal;
 
         const row: DurableSubscription = {
@@ -326,7 +328,6 @@ export class DurableSubscriptionStore extends PuterStore {
             appUid: input.appUid,
             permission: input.permission,
             delivery: input.delivery,
-            targets,
             handlerName: input.handlerName,
             context: input.context,
             ...(input.includeValue ? { includeValue: true } : {}),
@@ -350,7 +351,7 @@ export class DurableSubscriptionStore extends PuterStore {
             delivery: row.delivery,
             ops: row.op,
             handler_name: row.handlerName,
-            targets: JSON.stringify(row.targets),
+            targets: legacyTargets(row.appUid),
             context: row.context,
             permission: row.permission,
             include_value: row.includeValue ? 1 : 0,
@@ -361,8 +362,17 @@ export class DurableSubscriptionStore extends PuterStore {
         // Concurrent creates can all pass the count above. Counted again with
         // this row in it, each one past the cap takes itself back out — at
         // the last slot that may refuse more than it had to, never fewer.
-        const lost = await this.#overQuota(input, 1);
+        const held = await this.countForHolder(
+            input.holderUserId,
+            input.appUid,
+        );
+        const lost = quotaRefusal(input, held, 1);
         if (lost) throw new DurableQuotaRaceLost(lost, await this.remove(row));
+        if (held.terminal > EVENTS_REVOKED_SUBSCRIPTIONS_KEPT)
+            await this.#dropOldestTerminal(
+                input.holderUserId,
+                held.terminal - EVENTS_REVOKED_SUBSCRIPTIONS_KEPT,
+            );
 
         // Write-through, and over the whole owner rather than the one row: it
         // costs the same indexed read as a warm would, on a path rate-limited
@@ -524,6 +534,30 @@ export class DurableSubscriptionStore extends PuterStore {
     }
 
     /**
+     * Replace one row's `context`, keeping its id and whatever it is still
+     * owed. Null when a concurrent unsubscribe already deleted the row.
+     */
+    async updateContext(
+        row: DurableSubscription,
+        context: string | null,
+    ): Promise<{ row: DurableSubscription; bump: GenerationBump } | null> {
+        this.#assertContext(context);
+        const written = await this.clients.db.write(
+            `UPDATE \`${TABLE}\` SET \`context\` = ? WHERE \`sub_id\` = ?`,
+            [context, row.subId],
+        );
+        if (!written.anyRowsAffected) return null;
+
+        // Rebuilt from the table rather than cached from `row`: a row
+        // suspended since it was read must not go back into the cache.
+        await this.#rebuildRegion(row.ownerUserId);
+        return {
+            row: { ...row, context },
+            bump: await this.#bump(row.ownerUserId),
+        };
+    }
+
+    /**
      * Bring this region's cache for one owner up to date with the table, unless
      * it already is. Returns whether the table was read, which is what the
      * hot-path tests assert on.
@@ -634,16 +668,27 @@ export class DurableSubscriptionStore extends PuterStore {
     async countForHolder(
         holderUserId: number,
         appUid: string | null = null,
-    ): Promise<{ total: number; forApp: number }> {
+    ): Promise<DurableHolderCount> {
+        const terminal = TERMINAL_SUSPENDED_REASONS;
         const [row] = await this.clients.db.pread(
-            `SELECT COUNT(*) AS \`total\`, ` +
-                'SUM(CASE WHEN `app_uid` = ? THEN 1 ELSE 0 END) AS `for_app` ' +
+            `SELECT SUM(CASE WHEN ${TERMINAL_CLAUSE} THEN 0 ELSE 1 END) AS \`total\`, ` +
+                `SUM(CASE WHEN ${TERMINAL_CLAUSE} THEN 0 ` +
+                'WHEN `app_uid` = ? THEN 1 ELSE 0 END) AS `for_app`, ' +
+                `SUM(CASE WHEN ${TERMINAL_CLAUSE} THEN 1 ELSE 0 END) AS \`terminal\` ` +
                 `FROM \`${TABLE}\` WHERE \`holder_user_id\` = ? AND ${this.#unexpiredClause()}`,
-            [appUid, holderUserId, nowSeconds()],
+            [
+                ...terminal,
+                ...terminal,
+                appUid,
+                ...terminal,
+                holderUserId,
+                nowSeconds(),
+            ],
         );
         return {
             total: Number(row?.total ?? 0),
             forApp: Number(row?.for_app ?? 0),
+            terminal: Number(row?.terminal ?? 0),
         };
     }
 
@@ -652,11 +697,12 @@ export class DurableSubscriptionStore extends PuterStore {
      * index the listing and the quota use — passing `appUid` narrows to one
      * app's rows, which is what a grant made to that app can have authorized.
      *
-     * `includeSuspended` also returns rows already out of service. A revocation
-     * needs them: the three resumable reasons hold a backlog, and a row skipped
-     * here comes back in service on the next resume and hands it over.
+     * `includeSuspended` also returns rows out of service for a reason that
+     * lifts. A revocation needs them: those reasons hold a backlog, and a row
+     * skipped here comes back in service on the next resume and hands it over.
      *
-     * Bounded by the per-account quota, so the whole set fits one read.
+     * Bounded by the per-account quota, so the whole set fits one read. Rows
+     * suspended for good hold no slot, so they are left out.
      */
     async listActiveForHolder(
         holderUserId: number,
@@ -665,10 +711,16 @@ export class DurableSubscriptionStore extends PuterStore {
     ): Promise<DurableSubscription[]> {
         const where = [
             '`holder_user_id` = ?',
-            ...(opts.includeSuspended ? [] : ['`suspended_at` IS NULL']),
+            opts.includeSuspended
+                ? `NOT ${TERMINAL_CLAUSE}`
+                : '`suspended_at` IS NULL',
             this.#unexpiredClause(),
         ];
-        const params: unknown[] = [holderUserId, nowSeconds()];
+        const params: unknown[] = [
+            holderUserId,
+            ...(opts.includeSuspended ? TERMINAL_SUSPENDED_REASONS : []),
+            nowSeconds(),
+        ];
         if (appUid !== null) {
             where.push('`app_uid` = ?');
             params.push(appUid);
@@ -801,28 +853,24 @@ export class DurableSubscriptionStore extends PuterStore {
     // -- Internals ---------------------------------------------------
 
     /**
-     * The refusal for a create whose holder is at a cap, or `null`. `own` is
-     * how many of the counted rows are this create's — none before its insert,
-     * one after.
+     * Delete a holder's oldest rows suspended for good, past what `list` keeps.
+     * Best-effort: the next subscribe tries again.
      */
-    async #overQuota(
-        input: DurableSubscriptionInput,
-        own: 0 | 1,
-    ): Promise<HttpError | null> {
-        const perUser = Math.min(
-            input.limits?.perUser ?? EVENTS_DURABLE_SUBSCRIPTIONS_MAX,
-            EVENTS_DURABLE_SUBSCRIPTIONS_MAX,
-        );
-        const perApp = input.limits?.perApp ?? perUser;
-        const held = await this.countForHolder(
-            input.holderUserId,
-            input.appUid,
-        );
-        if (held.total - own >= perUser)
-            return quotaReached(perUser, 'account');
-        if (input.appUid !== null && held.forApp - own >= perApp)
-            return quotaReached(perApp, 'app');
-        return null;
+    async #dropOldestTerminal(
+        holderUserId: number,
+        count: number,
+    ): Promise<void> {
+        try {
+            const rows = await this.clients.db.pread(
+                `SELECT ${SELECT_COLUMNS} FROM \`${TABLE}\` ` +
+                    `WHERE \`holder_user_id\` = ? AND ${TERMINAL_CLAUSE} ` +
+                    'ORDER BY `suspended_at`, `id` LIMIT ?',
+                [holderUserId, ...TERMINAL_SUSPENDED_REASONS, count],
+            );
+            await this.#reap(rows.map(toRow));
+        } catch (err) {
+            console.warn('[events] could not drop old revoked rows', err);
+        }
     }
 
     /**
@@ -922,30 +970,6 @@ export class DurableSubscriptionStore extends PuterStore {
         const owners = new Set(rows.map((row) => row.ownerUserId));
         for (const ownerUserId of owners) await this.#bump(ownerUserId);
         return rows.length;
-    }
-
-    /**
-     * The row cannot exist with transports its delivery class cannot use, or
-     * with a `worker` target and no app to run one for — "one events worker per
-     * app" means no app is no worker target, not a worker with nowhere to go.
-     * Held here rather than only at the API, so a writer that never passes
-     * through one cannot leave an unsatisfiable row behind.
-     */
-    #assertTargets(
-        delivery: DeliveryClass,
-        targets: readonly string[],
-        appUid: string | null,
-    ): SubscriptionTarget[] {
-        if (!Array.isArray(targets) || targets.length === 0)
-            throw invalidTargets();
-        if (!targets.every(isSubscriptionTarget)) throw invalidTargets();
-
-        const unique = [...new Set(targets as SubscriptionTarget[])];
-        if (!targetsAllowedForDelivery(delivery, unique, appUid))
-            throw pushOnSingle();
-        if (appUid === null && unique.includes('worker'))
-            throw workerNeedsApp();
-        return unique;
     }
 
     #assertContext(context: string | null): void {

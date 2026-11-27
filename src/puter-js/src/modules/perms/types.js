@@ -26,6 +26,7 @@
  *     | 'appData'
  *     | 'appRootDir'
  *     | 'backgroundEvents'
+ *     | 'pushNotifications'
  *     | 'kvShare'
  *     | 'permission'} PermsResource
  */
@@ -74,7 +75,8 @@
  * @typedef {Object} PermsKvShareRequest
  * @property {string} prefix - The key prefix of the region, such as
  *   `'workspace:abc:'`. Not the whole namespace, and not a pattern.
- * @property {PermsKvShareAccess} [access] - Defaults to `'watch'`.
+ * @property {PermsKvShareAccess} [access] - Defaults to `'read'`, the level
+ *   `puter.kv.share()` creates by default.
  */
 
 /**
@@ -107,8 +109,8 @@
  * at once go under a single prompt.
  *
  * @deprecated Use the resource the string names: `'fs'`, `'email'`, `'apps'`,
- *   `'subdomains'`, `'appData'`, `'appRootDir'`, `'backgroundEvents'`, or
- *   `'kvShare'`.
+ *   `'subdomains'`, `'appData'`, `'appRootDir'`, `'backgroundEvents'`,
+ *   `'pushNotifications'`, or `'kvShare'`.
  *
  * @typedef {Object} PermsPermissionRequest
  * @property {string} [permission] - One permission string.
@@ -135,7 +137,7 @@
  * One batch entry: the resource, with its own details in the same object, so
  * one array can carry entries that each take different fields.
  *
- * @typedef {{ resource: 'email' | 'backgroundEvents' }
+ * @typedef {{ resource: 'email' | 'backgroundEvents' | 'pushNotifications' }
  *     | ({ resource: 'fs' } & PermsFsRequest)
  *     | ({ resource: 'folder' } & PermsFolderRequest)
  *     | ({ resource: 'kvShare' } & PermsKvShareRequest)

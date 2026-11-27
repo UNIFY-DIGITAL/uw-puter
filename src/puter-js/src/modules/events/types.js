@@ -54,9 +54,9 @@
  * @property {unknown} [value] What the key holds after the change — the
  *   written value on a `set`, `null` on a `del`. Present only on a
  *   subscription made with `includeValue`. Left out when the value is over
- *   16 KB serialized, when more than 128 subscriptions match the change, or
- *   when there were more subscription filters to check than one change may
- *   check. Read the key when it's absent. An `expire` never carries one.
+ *   16 KB serialized, when the change already went out with its value to 128
+ *   subscriptions, or through a share handle whose share is at `watch`. Read
+ *   the key when it's absent. An `expire` never carries one.
  * @property {boolean} self `true` when the change was made by the account
  *   holding the subscription.
  * @property {boolean} viaWorker As on {@link PuterEvent}.
@@ -72,7 +72,8 @@
  * the copy it already has.
  *
  * @typedef {Object} PuterNotifEvent
- * @property {string} id The notification's uid, and the dedup key.
+ * @property {string} id The notification's uid, and the dedup key together with
+ *   `ts` when `replaced` is set.
  * @property {string} subject `notif:<appId|userId>:<audience>`, naming the
  *   slice of the mailbox it belongs to.
  * @property {'post'} op Always `'post'` — the mailbox verbs (marking one read
@@ -87,8 +88,12 @@
  * @property {Record<string, unknown>} notification The stored payload: always
  *   `type`, a `title` on everything Puter sends, and fields that depend on
  *   `type`.
+ * @property {true} [replaced] Present when it replaced an earlier notification
+ *   under the same uid.
  * @property {boolean} self Always `true`: a mailbox is your own.
  * @property {number} ts When it was created, in milliseconds since the epoch.
+ *   On a replacement, when it was replaced, and the same on its live and
+ *   fetched copies.
  * @property {number} seq Position within one dispatch.
  */
 
@@ -101,7 +106,8 @@
  *   visible to an app), `notif:app-user` for an app's own, or
  *   `notif:<appId>:<audience>` in full.
  * @property {string} [cursor] The `cursor` from the previous page. Absent
- *   starts from the oldest notification still kept.
+ *   starts from the oldest notification still kept. A read from a cursor also
+ *   returns notifications replaced since, even ones from earlier pages.
  * @property {string} [after] The older name for `cursor`, still accepted.
  *   `cursor` wins when both are given.
  * @property {number} [limit] Events per page. Capped at 200; defaults to 50.
@@ -157,10 +163,10 @@
  *   subscription — the ambient one when the handler runs in a client.
  * @property {(input: unknown, init?: unknown) => Promise<unknown>} [fetch]
  *   `puter.net.fetch` where it exists, the environment's `fetch` otherwise.
- * @property {() => Promise<void>} [ack] Settles the delivery. Present only on a
- *   `single` subscription: calling it hands the delivery back as taken,
- *   returning without calling it does the same, and throwing does neither — the
- *   delivery is offered again when its lease lapses.
+ * @property {() => Promise<void>} [ack] Optional. Marks a `queue` delivery done
+ *   before the handler finishes, so a later throw does not undo it. Resolving
+ *   marks it done anyway; a throw drops it unless it is retryable (a network,
+ *   timeout, rate-limit or 5xx error, or one thrown with `retry: true`).
  */
 
 /**
@@ -196,20 +202,20 @@
  * @typedef {Object} OnPersistentOptions
  * @property {string} subject What to watch — the same grammar `onLocal()`
  *   takes, e.g. `fs:~/Documents` or `fs:~/inbox/*.json:add`.
- * @property {'broadcast' | 'single'} [delivery] `broadcast` (the default)
- *   delivers to everything listening; `single` delivers to exactly one
- *   consumer, which must acknowledge, and requires a `handlerName`.
- * @property {Array<'socket' | 'worker' | 'push'>} [targets] Transports the
- *   deliveries may take. Defaults to `['socket', 'worker']` when an app
- *   subscribes and `['socket']` when an account session with no app does. A
- *   `single` subscription may not target `push`.
+ * @property {boolean} [queue] Work-queue delivery: each event goes to one
+ *   consumer at a time and is offered again until acknowledged. Requires a
+ *   `handlerName`. Without it, every event runs the app's published handler
+ *   in its events worker and also reaches every connected client, once each.
+ * @property {'broadcast' | 'single'} [delivery] Deprecated: use `queue`.
+ *   `'single'` is the same as `queue: true`.
+ * @property {unknown[]} [targets] Deprecated and ignored.
  * @property {string} [handlerName] The published handler this subscription
- *   binds to. Required for `single`.
+ *   binds to. Required for `queue`.
  * @property {Function | string | { file: string }} [handler] The handler
  *   source this subscription was written against. Sent as a hash, not as
  *   source: the subscription binds only if it matches what is published under
  *   `handlerName`, which is also required when this is given. A function also
- *   runs in this client, on the deliveries the server leaves to clients.
+ *   runs in this client for each delivery it receives.
  * @property {Record<string, unknown>} [context] Values the handler needs,
  *   evaluated **now** and delivered as a frozen `ctx` on every invocation.
  *   Capped at 4 KB serialized.
@@ -229,6 +235,15 @@
  */
 
 /**
+ * What `update()` changes on a persistent subscription.
+ *
+ * @typedef {Object} UpdatePersistentOptions
+ * @property {Record<string, unknown> | null} context Replaces the stored
+ *   `context`, evaluated **now** like the one `onPersistent()` takes. `null`
+ *   clears it. Capped at 4 KB serialized.
+ */
+
+/**
  * A subscription that outlives the connection that made it.
  *
  * `context` values are deliberately absent: the column holds whatever secret
@@ -237,8 +252,8 @@
  * that changes when any value does.
  *
  * @typedef {Object} PersistentSubscription
- * @property {string} subId The subscription's id, and what `unsubscribe()`
- *   names. Stable for the life of the subscription.
+ * @property {string} subId The subscription's id, and what `update()` and
+ *   `unsubscribe()` name. Stable for the life of the subscription.
  * @property {string} subject For `kv:` and `notif:`, the subject in full form,
  *   e.g. `kv:cart` as `kv:<appId>:cart`. For `fs:`, as passed.
  * @property {EventAnchor} anchor The node it is keyed to.
@@ -248,9 +263,8 @@
  *   covers everything under it.
  * @property {string | null} op The single operation it is limited to, or
  *   `null` for all of them.
- * @property {Array<'socket' | 'worker' | 'push'>} targets Transports its
- *   deliveries may take.
- * @property {'broadcast' | 'single'} delivery Its delivery class.
+ * @property {boolean} queue Whether each event goes to one consumer at a
+ *   time and is offered again until acknowledged.
  * @property {boolean} includeValue Whether its `kv:` deliveries carry the
  *   key's new value.
  * @property {string | null} handlerName The handler it is bound to.

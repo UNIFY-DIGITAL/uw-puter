@@ -373,6 +373,12 @@ const examples = [
                 source: '/playground/examples/fs-stat.html',
             },
             {
+                title: 'See Whether a File Is Shared',
+                description: 'See who a file is shared with from its metadata, using the Puter.js filesystem API. Run and experiment with this code example in the playground.',
+                slug: 'fs-stat-shares',
+                source: '/playground/examples/fs-stat-shares.html',
+            },
+            {
                 title: 'Copy File/Directory',
                 description: 'Copy files and directories with Puter.js filesystem API. Run and experiment with this code example in the playground.',
                 slug: 'fs-copy',
@@ -647,18 +653,6 @@ const examples = [
                 source: '/playground/examples/events-off.html',
             },
             {
-                title: 'Keep Watching in the Background',
-                description: 'Publish a handler and create a persistent subscription that keeps running when your app is closed, using the Puter.js Events API. Try it in the playground.',
-                slug: 'events-persistent',
-                source: '/playground/examples/events-persistent.html',
-            },
-            {
-                title: 'Bind to a Handler Version',
-                description: 'Create a persistent subscription that only binds to the handler source you wrote against, using the Puter.js Events API. Run it in the playground.',
-                slug: 'events-persistent-pinned',
-                source: '/playground/examples/events-persistent-pinned.html',
-            },
-            {
                 title: 'List Persistent Subscriptions',
                 description: 'List the persistent subscriptions an account holds with the Puter.js Events API. Run and experiment with this example in the playground.',
                 slug: 'events-list',
@@ -669,6 +663,12 @@ const examples = [
                 description: 'Find persistent subscriptions that stopped delivering, and why, with the Puter.js Events API. Try it in the playground.',
                 slug: 'events-list-suspended',
                 source: '/playground/examples/events-list-suspended.html',
+            },
+            {
+                title: "Change a Subscription's Context",
+                description: 'Change the context of a persistent subscription without ending it, using the Puter.js Events API. Run it in the playground.',
+                slug: 'events-update',
+                source: '/playground/examples/events-update.html',
             },
             {
                 title: 'End a Persistent Subscription',
@@ -688,23 +688,16 @@ const examples = [
                 slug: 'events-fetch-then-listen',
                 source: '/playground/examples/events-fetch-then-listen.html',
             },
+        ],
+    },
+    {
+        title: 'Notifications',
+        children: [
             {
-                title: 'Publish and Remove a Handler',
-                description: 'Publish, list and remove an events handler with the Puter.js Events API. Run and experiment with this example in the playground.',
-                slug: 'events-handlers',
-                source: '/playground/examples/events-handlers.html',
-            },
-            {
-                title: 'Deploy a Set of Handlers',
-                description: 'Publish several events handlers in one call from a build step with the Puter.js Events API. Run it in the playground.',
-                slug: 'events-handlers-publish-all',
-                source: '/playground/examples/events-handlers-publish-all.html',
-            },
-            {
-                title: 'List and Destroy Events Workers',
-                description: 'List the apps that have an events worker and destroy one you no longer need, using the Puter.js Events API. Try it in the playground.',
-                slug: 'events-workers',
-                source: '/playground/examples/events-workers.html',
+                title: 'Send a Notification',
+                description: 'Listen for your app\'s notifications and send one with the Puter.js Notifications API. Run it in the playground.',
+                slug: 'notifications-notify',
+                source: '/playground/examples/notifications-notify.html',
             },
         ],
     },
@@ -774,6 +767,12 @@ const examples = [
                 description: 'Get website information with Puter.js hosting API. Run and experiment with this example directly in the playground.',
                 slug: 'hosting-get',
                 source: '/playground/examples/hosting-get.html',
+            },
+            {
+                title: 'Connect a custom domain to a website',
+                description: 'Let the user connect their own domain to a website with Puter.js hosting API. Run and experiment with this example directly in the playground.',
+                slug: 'hosting-attach',
+                source: '/playground/examples/hosting-attach.html',
             },
             {
                 title: 'Publish a portfolio page',

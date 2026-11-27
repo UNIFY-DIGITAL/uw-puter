@@ -26,6 +26,7 @@ import FSItem from './modules/FSItem.js';
 import { Hosting } from './modules/hosting/index.js';
 import { KV } from './modules/kv/index.js';
 import { netAPI } from './modules/networking/index.js';
+import { Notifications } from './modules/notifications/index.js';
 import { OS } from './modules/os/index.js';
 import { Perms } from './modules/perms/index.js';
 import PuterDialog from './modules/PuterDialog.js';
@@ -181,6 +182,8 @@ export class Puter {
     email;
     /** @type {InstanceType<typeof Events>} */
     events;
+    /** @type {InstanceType<typeof Notifications>} */
+    notifications;
     /** @type {InstanceType<typeof Perms>} */
     perms;
     /** @type {InstanceType<typeof Teams>} */
@@ -323,6 +326,10 @@ export class Puter {
         this.email = this.registerModule('email', Email);
         this.events = this.registerModule('events', Events);
         this.perms = this.registerModule('perms', Perms);
+        this.notifications = this.registerModule(
+            'notifications',
+            Notifications,
+        );
         this.teams = this.registerModule('teams', Teams);
         this.drivers = this.registerModule('drivers', Drivers);
         this.debug = this.registerModule('debug', Debug);
@@ -722,8 +729,6 @@ export class Puter {
         // When SDK is loaded in GUI the initiation process should start when the DOM is ready. This is because
         // the SDK needs to show a dialog to the user to ask for permission to access their Puter account.
         else if (this.env === 'web') {
-            // initialize submodules
-            this.initSubmodules();
             try {
                 const storedToken = this.normalizeAuthTokenCandidate(
                     localStorage.getItem(STORAGE_KEY_V2),
@@ -753,6 +758,8 @@ export class Puter {
                 // Handle the error here
                 console.error('Error accessing localStorage:', error);
             }
+
+            this.initSubmodules();
 
             // Print a CTA for developers to publish their app on the Puter App Store
             this.printDevCTA();
@@ -2015,9 +2022,14 @@ globalThis.addEventListener &&
                 '*',
             );
         } else if (event.data.msg === 'puter.token') {
+            if (puter.auth?.pendingSignInMessageIds_?.has(event.data.msg_id))
+                return;
             if (!puter.tokenSourceAllowed_(event.source)) {
                 return;
             }
+            // Could be a late reply from an old popup; the flow that owns the
+            // prompt settles its own failures.
+            if (event.data.success === false) return;
             // Set the authToken property
             puter.setAuthToken(event.data.token);
             // update appID only when token does not include app identity
@@ -2038,7 +2050,8 @@ globalThis.addEventListener &&
                 // Not awaited: the waiting sign-ins below settle first.
                 (async () => {
                     try {
-                        puter.onAuth(await puter.getUser());
+                        const user = await puter.whoamiCache_;
+                        puter.onAuth(user ?? (await puter.getUser()));
                     } catch (e) {
                         console.error(e);
                     }

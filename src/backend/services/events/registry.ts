@@ -110,6 +110,12 @@ export interface ProjectedNotifEvent extends ProjectedEventBase {
     /** App the notification is about; `null` for platform notifications. */
     appUid: string | null;
     notification: Record<string, unknown>;
+    /**
+     * Present when the notification replaced an earlier one under the same uid.
+     * `ts` is then the replacement time, the same on live and fetched copies,
+     * so it versions the uid.
+     */
+    replaced?: true;
 }
 
 export type ProjectedEvent =
@@ -200,6 +206,8 @@ export interface NotifEventContext extends EventContextBase {
     audience: NotificationAudience;
     appUid: string | null;
     notification: Record<string, unknown>;
+    /** An earlier notification replaced in place; `ts` is when. */
+    replaced?: true;
 }
 
 export type FsDeliveryContext = FsEventContext & DeliveryFields;
@@ -345,6 +353,7 @@ const notifProject = (delivery: NotifDeliveryContext): ProjectedNotifEvent => ({
     audience: delivery.audience,
     appUid: delivery.appUid,
     notification: delivery.notification,
+    ...(delivery.replaced ? { replaced: true as const } : {}),
     self: delivery.self,
     ts: delivery.ts,
     seq: delivery.seq,
@@ -443,6 +452,14 @@ export const UNPUBLISHED_INTERNAL_EVENTS = [
     {
         event: 'kv.share.retired',
         reason: 'A share handle stopping is not a change to any key; it ends the subscriptions made through the handle rather than being delivered to them.',
+    },
+    {
+        event: 'notif.written',
+        reason: 'A node-local hook after a notification is written, for extensions; the notification itself publishes through `notif.created`.',
+    },
+    {
+        event: 'notif.delivery.settled',
+        reason: 'A node-local report on how the live socket copy of a notification went; the notification itself publishes through `notif.created`.',
     },
 ] as const satisfies readonly UnpublishedInternalEvent[];
 

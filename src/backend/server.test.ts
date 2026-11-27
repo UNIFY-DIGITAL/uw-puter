@@ -36,7 +36,11 @@ import { Controller, Get } from './core/http/decorators.ts';
 import { HttpError } from './core/http/HttpError.ts';
 import { extension, extensionStore } from './extensions.ts';
 import { PuterServer } from './server.ts';
-import { allocateEphemeralPort, setupTestServer } from './testUtil.ts';
+import {
+    allocateEphemeralPort,
+    createTestUser,
+    setupTestServer,
+} from './testUtil.ts';
 import type { IConfig } from './types';
 
 /**
@@ -468,9 +472,62 @@ describe('PuterServer host header validation — permissive modes', () => {
     });
 });
 
+describe('PuterServer host header validation — custom domains with every host accepted', () => {
+    let server: PuterServer;
+    let port: number;
+
+    beforeAll(async () => {
+        port = await allocateEphemeralPort();
+        server = await setupTestServer(
+            {
+                port,
+                domain: 'puter.localhost',
+                origin: `http://puter.localhost:${port}`,
+                allow_all_host_values: true,
+                custom_domains_enabled: true,
+                static_hosting_domain: 'site.puter.localhost',
+            } as unknown as IConfig,
+            { listen: true },
+        );
+    });
+
+    afterAll(async () => {
+        await server?.shutdown();
+    });
+
+    it('still hands a host outside our domains to site hosting', async () => {
+        const res = await rawRequest(port, '/', {
+            host: 'www.my-own-domain.example',
+        });
+        expect(res.status).toBe(404);
+        expect(res.body).toBe('Site not found');
+    });
+
+    it('leaves our own domain to the GUI', async () => {
+        const res = await rawRequest(port, '/healthcheck', {
+            host: `puter.localhost:${port}`,
+        });
+        expect(res.status).toBe(200);
+    });
+
+    it('never treats an IP or localhost as a custom domain', async () => {
+        for (const host of [
+            `127.0.0.1:${port}`,
+            `[::1]:${port}`,
+            `localhost:${port}`,
+        ]) {
+            const res = await rawRequest(port, '/healthcheck', { host });
+            expect(res.status, host).toBe(200);
+            const root = await rawRequest(port, '/', { host });
+            expect(root.body, host).not.toBe('Site not found');
+        }
+    });
+});
+
 describe('PuterServer request parsing', () => {
     let server: PuterServer;
     let port: number;
+    let token: string;
     const routeCount = { before: 0 };
 
     beforeAll(async () => {
@@ -499,6 +556,10 @@ describe('PuterServer request parsing', () => {
             } as unknown as IConfig,
             { listen: true },
         );
+        ({ token } = await createTestUser(server, {
+            username: 'large_body_user',
+            password: 'large-body-password',
+        }));
     });
 
     afterAll(async () => {
@@ -507,6 +568,85 @@ describe('PuterServer request parsing', () => {
     });
 
     const host = () => `puter.localhost:${port}`;
+
+    const MiB = 1024 * 1024;
+    const postJson = (
+        path: string,
+        payload: string,
+        headers: Record<string, string> = {},
+    ) =>
+        rawRequest(
+            port,
+            path,
+            {
+                host: `api.puter.localhost:${port}`,
+                'content-type': 'application/json',
+                'content-length': String(Buffer.byteLength(payload)),
+                ...headers,
+            },
+            'POST',
+            payload,
+        );
+
+    it.each([
+        '/drivers/call',
+        '/puterai/openai/v1/chat/completions',
+        '/puterai/anthropic/v1/messages',
+        '/puterai/anthropic/v1/messages/count_tokens',
+    ])(
+        'keeps the default JSON limit on %s without a credential',
+        async (path) => {
+            const payload = JSON.stringify({ text: 'x'.repeat(51 * MiB) });
+            expect((await postJson(path, payload)).status).toBe(413);
+        },
+    );
+
+    it('parses a chat call above 50 MiB for a signed-in caller', async () => {
+        const payload = JSON.stringify({
+            interface: 'puter-chat-completion',
+            method: 'no-such-method',
+            pad: 'x'.repeat(51 * MiB),
+        });
+        for (const contentType of [
+            'application/json',
+            'text/plain;actually=json',
+        ]) {
+            const res = await postJson('/drivers/call', payload, {
+                'content-type': contentType,
+                authorization: `Bearer ${token}`,
+            });
+            // The controller read `method` out of the body.
+            expect(res.status, contentType).toBe(404);
+            expect(res.body).toContain('no-such-method');
+        }
+    });
+
+    it('keeps the default JSON limit for other drivers', async () => {
+        const payload = JSON.stringify({
+            interface: 'puter-kvstore',
+            method: 'get',
+            pad: 'x'.repeat(51 * MiB),
+        });
+        // Routing matches these spellings too.
+        for (const path of ['/drivers/call', '/Drivers/Call/']) {
+            const res = await postJson(path, payload, {
+                authorization: `Bearer ${token}`,
+            });
+            expect(res.status, path).toBe(413);
+        }
+    });
+
+    it.each([
+        ['/drivers/call', 128],
+        ['/puterai/anthropic/v1/messages', 128],
+        ['/raw-probe', 50],
+    ])('rejects bodies above the JSON limit on %s', async (path, limitMiB) => {
+        const payload = JSON.stringify({ text: 'x'.repeat(limitMiB * MiB) });
+        const res = await postJson(path, payload, {
+            authorization: `Bearer ${token}`,
+        });
+        expect(res.status).toBe(413);
+    });
 
     it('parses the user agent the first time a handler reads it', async () => {
         const agent =
@@ -1348,7 +1488,7 @@ describe('PuterServer keep-alive timeout', () => {
 });
 
 describe('PuterServer lifecycle hooks', () => {
-    it('runs prepare-shutdown bottom-up, once, before tearing down', async () => {
+    it('runs drain-start and prepare-shutdown bottom-up, once, before tearing down', async () => {
         const port = await allocateEphemeralPort();
         const server = await setupTestServer({ port } as unknown as IConfig, {
             listen: true,
@@ -1356,6 +1496,9 @@ describe('PuterServer lifecycle hooks', () => {
 
         const order: string[] = [];
         const probe = (label: string) => ({
+            onServerDrainStart: (info?: { drainMs?: number }) => {
+                order.push(`drain:${label}:${info?.drainMs}`);
+            },
             onServerPrepareShutdown: () => {
                 order.push(`prepare:${label}`);
             },
@@ -1373,10 +1516,15 @@ describe('PuterServer lifecycle hooks', () => {
             (layer as Record<string, unknown>).hookOrderProbe = probe(label);
         }
 
-        await server.prepareShutdown();
+        await server.prepareShutdown({ drainMs: 1_000 });
         await server.shutdown();
 
         expect(order).toEqual([
+            'drain:client:1000',
+            'drain:store:1000',
+            'drain:service:1000',
+            'drain:controller:1000',
+            'drain:driver:1000',
             'prepare:client',
             'prepare:store',
             'prepare:service',

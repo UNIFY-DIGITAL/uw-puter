@@ -33,10 +33,12 @@ import {
     validateIconDataUrl,
 } from '../../util/appIcon.js';
 import { toAppReadView } from '../../util/appView.js';
+import { awaitLater } from '../../util/concurrency.js';
 import { isUniqueViolation } from '../../util/dbError.js';
 import {
     buildHostedSubdomainIndexUrlCandidates,
     extractPuterHostedSubdomain,
+    resolveCustomHostSubdomain,
 } from '../../util/hostedAppBacking.js';
 import {
     normalizeLimit,
@@ -203,30 +205,38 @@ export class AppDriver extends PuterDriver {
 
         const fields = await this.#validateInput(object, { isCreate: true });
 
-        // Puter-hosted index_url handling. Order matches v1 AppES:
-        //   1. Refuse if the index_url's subdomain isn't owned by this user.
+        // Puter-hosted index_url handling (custom domains included). Order
+        // matches v1 AppES:
+        //   1. Refuse if the index_url's site isn't owned by this user.
         //   2. Try to merge into an existing row with the same index_url
         //      (origin-bootstrap takeover, or claiming an unowned row).
         //   3. Otherwise enforce index_url uniqueness so two rows can't
         //      share a hosted URL.
+        // The name lookup runs alongside so the host checks add no round
+        // trip of their own.
+        const nameTaken = awaitLater(this.appStore.existsByName(fields.name));
+        const customSite = await this.#customSiteForIndexUrl(fields.index_url);
         await this.#ensurePuterSiteSubdomainIsOwned(
             fields.index_url,
             actor.user,
+            customSite,
         );
         const joinedApp = await this.#maybeJoinOwnedHostedIndexUrlApp({
             object,
             options,
             user: actor.user,
+            customSite,
         });
         if (joinedApp) {
             return joinedApp;
         }
         await this.#ensureIndexUrlNotAlreadyInUse({
             indexUrl: fields.index_url,
+            customSite,
         });
 
         // Name conflict handling
-        if (await this.appStore.existsByName(fields.name)) {
+        if (await nameTaken) {
             if (options?.dedupe_name) {
                 let candidate;
                 let i = 0;
@@ -273,8 +283,11 @@ export class AppDriver extends PuterDriver {
                 legacyCode: 'app_name_already_in_use',
             });
         }
-        if (filetypes)
+        if (filetypes) {
             await this.appStore.setFiletypeAssociations(app.id, filetypes);
+            // The row was built before they were stored; views re-read them.
+            delete app.filetype_associations;
+        }
 
         this.#emitAppChanged({ app, action: 'created' });
 
@@ -424,13 +437,23 @@ export class AppDriver extends PuterDriver {
             existing: app,
         });
 
-        // Puter-hosted index_url handling on update — same flow as create
-        // but only when the index_url is actually changing. Self-app is
+        // Started before the index_url checks so they add no round trip.
+        const renaming = !!fields.name && fields.name !== app.name;
+        const nameTaken = renaming
+            ? awaitLater(this.appStore.existsByName(fields.name))
+            : null;
+
+        // Puter-hosted index_url handling on update — same flow as create.
+        // #validateInput already dropped an unchanged index_url. Self-app is
         // excluded from the conflict search via `excludeAppId`.
-        if (fields.index_url && fields.index_url !== app.index_url) {
+        if (fields.index_url) {
+            const customSite = await this.#customSiteForIndexUrl(
+                fields.index_url,
+            );
             await this.#ensurePuterSiteSubdomainIsOwned(
                 fields.index_url,
                 actor.user,
+                customSite,
             );
             const joinedApp = await this.#maybeJoinOwnedHostedIndexUrlApp({
                 object,
@@ -438,6 +461,7 @@ export class AppDriver extends PuterDriver {
                 user: actor.user,
                 sourceAppUid: app.uid,
                 excludeAppId: app.id,
+                customSite,
             });
             if (joinedApp) {
                 return joinedApp;
@@ -445,6 +469,7 @@ export class AppDriver extends PuterDriver {
             await this.#ensureIndexUrlNotAlreadyInUse({
                 indexUrl: fields.index_url,
                 excludeAppId: app.id,
+                customSite,
             });
             if (
                 app.is_private &&
@@ -465,14 +490,10 @@ export class AppDriver extends PuterDriver {
         }
 
         // Name conflict check (only if name is changing)
-        if (fields.name && fields.name !== app.name) {
-            if (await this.appStore.existsByName(fields.name)) {
-                throw new HttpError(
-                    409,
-                    'An app with this name already exists',
-                    { legacyCode: 'conflict' },
-                );
-            }
+        if (nameTaken && (await nameTaken)) {
+            throw new HttpError(409, 'An app with this name already exists', {
+                legacyCode: 'conflict',
+            });
         }
 
         const filetypes = fields.filetype_associations;
@@ -489,6 +510,8 @@ export class AppDriver extends PuterDriver {
         }
         if (filetypes !== undefined) {
             await this.appStore.setFiletypeAssociations(app.id, filetypes);
+            // A filetype-only update returns the cached row with the old ones.
+            if (updated) delete updated.filetype_associations;
         }
 
         this.#emitAppChanged({ app: updated, old_app: app, action: 'updated' });
@@ -618,13 +641,19 @@ export class AppDriver extends PuterDriver {
                 protocols: WEB_AND_EXTENSION_PROTOCOLS,
             });
             if (out.index_url) out.index_url = new URL(out.index_url).href;
-            // Only enforce on new/changed values so rows that already
-            // carry a reserved host (migration-seeded builtins) can still
-            // have their other fields updated.
+            // A value equal to the stored one after normalization is
+            // unchanged: drop it so legacy spellings stay as stored and
+            // skip the host checks (migration-seeded builtins carry
+            // reserved hosts). Rewriting it would make a dormant
+            // mixed-case/default-port row match again without checks.
             if (
+                existing &&
                 out.index_url !== undefined &&
-                out.index_url !== existing?.index_url
+                out.index_url ===
+                    (URL.parse(existing.index_url)?.href ?? existing.index_url)
             ) {
+                delete out.index_url;
+            } else if (out.index_url !== undefined) {
                 this.#assertIndexUrlHostAllowed(out.index_url);
             }
         }
@@ -856,6 +885,26 @@ export class AppDriver extends PuterDriver {
     }
 
     /**
+     * `{ host, subdomain }` when `indexUrl` is on a custom domain that serves
+     * one of our sites, else null. Such a host gets the hosted-subdomain rules:
+     * owner-only, one app per URL, bootstrap rows merged.
+     */
+    async #customSiteForIndexUrl(indexUrl) {
+        if (!indexUrl || this.#isPuterHostedIndexUrl(indexUrl)) return null;
+        const parsed = URL.parse(indexUrl);
+        if (parsed?.protocol !== 'https:' && parsed?.protocol !== 'http:') {
+            return null;
+        }
+        const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+        const subdomain = await resolveCustomHostSubdomain(
+            host,
+            this.config,
+            this.clients.event,
+        );
+        return subdomain ? { host, subdomain } : null;
+    }
+
+    /**
      * Read normalized origin-alias groups from config. Each group is a deduped
      * list of lowercased, trimmed bare hosts. Malformed entries are skipped so
      * a bad config row doesn't brick app create/update for everyone else.
@@ -934,9 +983,18 @@ export class AppDriver extends PuterDriver {
         }
     }
 
-    async #findIndexUrlConflictRow({ indexUrl, excludeAppId } = {}) {
+    async #findIndexUrlConflictRow({
+        indexUrl,
+        excludeAppId,
+        customSite,
+    } = {}) {
         const aliasGroup = this.#findOriginAliasGroupForIndexUrl(indexUrl);
-        if (!this.#isPuterHostedIndexUrl(indexUrl) && !aliasGroup) return null;
+        if (
+            !this.#isPuterHostedIndexUrl(indexUrl) &&
+            !aliasGroup &&
+            !customSite
+        )
+            return null;
 
         const candidates = new Set(
             this.#buildEquivalentIndexUrlCandidates(indexUrl),
@@ -955,15 +1013,18 @@ export class AppDriver extends PuterDriver {
 
         // For alias-group hosts, treat the group as a host-level reservation:
         // any row whose index_url is the root URL of any group member counts
-        // as a conflict, so a single app owns the whole group.
-        if (aliasGroup) {
-            for (const host of aliasGroup) {
-                for (const proto of ['https', 'http']) {
-                    const base = `${proto}://${host}`;
-                    candidates.add(base);
-                    candidates.add(`${base}/`);
-                    candidates.add(`${base}/index.html`);
-                }
+        // as a conflict, so a single app owns the whole group. A custom
+        // domain's root is reserved the same way.
+        const reservedHosts = [
+            ...(aliasGroup ?? []),
+            ...(customSite ? [customSite.host] : []),
+        ];
+        for (const host of reservedHosts) {
+            for (const proto of ['https', 'http']) {
+                const base = `${proto}://${host}`;
+                candidates.add(base);
+                candidates.add(`${base}/`);
+                candidates.add(`${base}/index.html`);
             }
         }
 
@@ -976,10 +1037,15 @@ export class AppDriver extends PuterDriver {
         });
     }
 
-    async #ensureIndexUrlNotAlreadyInUse({ indexUrl, excludeAppId } = {}) {
+    async #ensureIndexUrlNotAlreadyInUse({
+        indexUrl,
+        excludeAppId,
+        customSite,
+    } = {}) {
         const conflictRow = await this.#findIndexUrlConflictRow({
             indexUrl,
             excludeAppId,
+            customSite,
         });
         if (conflictRow) {
             throw new HttpError(400, 'App index_url already in use', {
@@ -992,9 +1058,11 @@ export class AppDriver extends PuterDriver {
         }
     }
 
-    async #ensurePuterSiteSubdomainIsOwned(indexUrl, user) {
+    async #ensurePuterSiteSubdomainIsOwned(indexUrl, user, customSite) {
         if (!user) return;
-        const subdomain = this.#extractPuterHostedSubdomain(indexUrl);
+        const subdomain =
+            customSite?.subdomain ??
+            this.#extractPuterHostedSubdomain(indexUrl);
         if (!subdomain) return;
 
         let row = await this.stores.subdomain.getBySubdomain(subdomain);
@@ -1007,10 +1075,19 @@ export class AppDriver extends PuterDriver {
             });
         }
         if (!row || row.user_id !== user.id) {
-            throw new HttpError(400, 'Subdomain not owned by user', {
-                legacyCode: 'subdomain_not_owned',
-                fields: { subdomain },
-            });
+            // A custom domain's site name isn't the caller's to learn.
+            throw new HttpError(
+                400,
+                customSite
+                    ? 'Domain not owned by user'
+                    : 'Subdomain not owned by user',
+                {
+                    legacyCode: 'subdomain_not_owned',
+                    fields: customSite
+                        ? { hostname: customSite.host }
+                        : { subdomain },
+                },
+            );
         }
     }
 
@@ -1123,17 +1200,19 @@ export class AppDriver extends PuterDriver {
         user,
         sourceAppUid,
         excludeAppId,
+        customSite,
     } = {}) {
         const indexUrl = object?.index_url;
-        // Alias-group hosts (`app_origin_aliases`) get the same merge
-        // treatment as puter-hosted subdomains. Without this, a bootstrap
-        // stub on a custom domain could never be absorbed — and since
-        // `#findIndexUrlConflictRow` *does* honor alias groups, the
-        // uniqueness check below would hard-reject the owner's own
-        // create/update instead of merging into the stub.
+        // Alias-group hosts (`app_origin_aliases`) and custom domains get the
+        // same merge treatment as puter-hosted subdomains. Without this, a
+        // bootstrap stub on such a host could never be absorbed — and since
+        // `#findIndexUrlConflictRow` *does* honor them, the uniqueness check
+        // below would hard-reject the owner's own create/update instead of
+        // merging into the stub.
         if (
             !this.#isPuterHostedIndexUrl(indexUrl) &&
-            !this.#findOriginAliasGroupForIndexUrl(indexUrl)
+            !this.#findOriginAliasGroupForIndexUrl(indexUrl) &&
+            !customSite
         ) {
             return null;
         }
@@ -1141,6 +1220,7 @@ export class AppDriver extends PuterDriver {
         const conflictRow = await this.#findIndexUrlConflictRow({
             indexUrl,
             excludeAppId,
+            customSite,
         });
         if (!conflictRow) return null;
 

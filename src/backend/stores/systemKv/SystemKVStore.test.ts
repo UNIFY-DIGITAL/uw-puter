@@ -182,7 +182,7 @@ describe('SystemKVStore', () => {
             const huge = 'a'.repeat(400 * 1024);
             await expect(
                 target.set({ key: 'big', value: huge }, opts),
-            ).rejects.toMatchObject({ statusCode: 400 });
+            ).rejects.toMatchObject({ statusCode: 400, code: 'value_too_large' });
         });
 
         it('clamps a number too large to store, rather than failing the write', async () => {
@@ -789,6 +789,215 @@ describe('SystemKVStore', () => {
                 batchDel.mockRestore();
             }
         });
+
+        it('reads its pages eventually consistent, as it is billed', async () => {
+            await target.set({ key: 'f1', value: 1 }, opts);
+            const query = vi.spyOn(server.clients.dynamo, 'query');
+            try {
+                await target.flush(opts);
+                expect(query.mock.calls.length).toBeGreaterThan(0);
+                for (const call of query.mock.calls) expect(call[5]).toBe(false);
+            } finally {
+                query.mockRestore();
+            }
+        });
+    });
+
+    describe('purgeNamespace', () => {
+        const appOpts = () => ({ actor, appUuid: 'app-purge-test' });
+        const namespaceOf = () =>
+            kvNamespace(actor.user!.uuid!, 'app-purge-test');
+        const seed = (count: number) =>
+            target.batchPut(
+                {
+                    items: Array.from({ length: count }, (_, i) => ({
+                        key: `p${i}`,
+                        value: i,
+                    })),
+                },
+                appOpts(),
+            );
+
+        it('deletes at most maxItems per call and reports when the namespace is empty', async () => {
+            await seed(5);
+
+            expect(
+                await target.purgeNamespace(namespaceOf(), { maxItems: 3 }),
+            ).toEqual({ deleted: 3, done: false });
+            expect(
+                (await target.list({ as: 'keys' }, appOpts())).res,
+            ).toHaveLength(2);
+
+            expect(
+                await target.purgeNamespace(namespaceOf(), { maxItems: 10 }),
+            ).toEqual({ deleted: 2, done: true });
+            expect(
+                await target.purgeNamespace(namespaceOf(), { maxItems: 10 }),
+            ).toEqual({ deleted: 0, done: true });
+        });
+
+        it('leaves the same user\'s other namespaces alone', async () => {
+            await seed(2);
+            await target.set({ key: 'global', value: 1 }, opts);
+
+            await target.purgeNamespace(namespaceOf(), { maxItems: 10 });
+
+            expect((await target.get({ key: 'global' }, opts)).res).toBe(1);
+        });
+
+        it('emits no mutation events', async () => {
+            await seed(2);
+            const emit = vi.spyOn(server.clients.event, 'emit');
+            try {
+                await target.purgeNamespace(namespaceOf(), { maxItems: 10 });
+                const keys = emit.mock.calls.map(([key]) => key);
+                expect(keys).not.toContain('kv.mutated');
+                expect(keys).not.toContain('kv.flushed');
+            } finally {
+                emit.mockRestore();
+            }
+        });
+
+        it('refuses the system namespace and anything that is not a user namespace', async () => {
+            for (const namespace of [
+                `v1:${SYSTEM_ACTOR_UUID}:${KV_GLOBAL_APP_KEY}`,
+                `v1:${SYSTEM_ACTOR_UUID}:${KV_GLOBAL_APP_KEY}:partition`,
+                `v1:${SYSTEM_ACTOR_UUID}:some-app`,
+                'v1:only-two',
+                'v2:user:app',
+                '',
+            ]) {
+                await expect(
+                    target.purgeNamespace(namespace, { maxItems: 10 }),
+                ).rejects.toThrow();
+            }
+        });
+
+        it('reads its pages with strong consistency', async () => {
+            await seed(2);
+            const query = vi.spyOn(server.clients.dynamo, 'query');
+            try {
+                await target.purgeNamespace(namespaceOf(), { maxItems: 10 });
+                const pageReads = query.mock.calls.filter(
+                    ([, keys]) =>
+                        (keys as { namespace?: string }).namespace ===
+                        namespaceOf(),
+                );
+                expect(pageReads.length).toBeGreaterThan(0);
+                for (const call of pageReads) expect(call[5]).toBe(true);
+            } finally {
+                query.mockRestore();
+            }
+        });
+
+        it('refuses a maxItems that is not a positive integer', async () => {
+            for (const maxItems of [0, -1, 1.5, Number.NaN]) {
+                await expect(
+                    target.purgeNamespace(namespaceOf(), { maxItems }),
+                ).rejects.toThrow();
+            }
+        });
+
+        it('asks stillWanted before deleting a page, and stops on a no', async () => {
+            await seed(3);
+            let asked = 0;
+            expect(
+                await target.purgeNamespace(namespaceOf(), {
+                    maxItems: 10,
+                    stillWanted: async () => {
+                        asked++;
+                        return false;
+                    },
+                }),
+            ).toEqual({ deleted: 0, done: false, stopped: true });
+            expect(asked).toBe(1);
+            expect(
+                (await target.list({ as: 'keys' }, appOpts())).res,
+            ).toHaveLength(3);
+
+            expect(
+                await target.purgeNamespace(namespaceOf(), {
+                    maxItems: 10,
+                    stillWanted: async () => true,
+                }),
+            ).toEqual({ deleted: 3, done: true });
+        });
+    });
+
+    describe('reserved items', () => {
+        const prefix = () =>
+            `test-reserved#${Math.random().toString(36).slice(2)}#`;
+
+        it('deletes one only while its condition holds', async () => {
+            const key = `${prefix()}item`;
+            const ifVersion = (version: number) =>
+                target.deleteReservedItemIf(
+                    key,
+                    '#v = :v',
+                    { ':v': version },
+                    { '#v': 'version' },
+                );
+            await target.putReservedItem(key, { version: 1 });
+
+            expect(await ifVersion(2)).toBe(false);
+            expect(await target.getReservedItem(key)).toMatchObject({
+                version: 1,
+            });
+            expect(await ifVersion(1)).toBe(true);
+            expect(await target.getReservedItem(key)).toBeNull();
+            expect(await ifVersion(1)).toBe(false);
+        });
+
+        it('pages through them in key order from where the last page ended', async () => {
+            const shared = prefix();
+            for (const name of ['a', 'b', 'c'])
+                await target.putReservedItem(`${shared}${name}`, { n: 1 });
+
+            const first = await target.pageReservedItems(shared, { limit: 2 });
+            expect(first.items.map((item) => item.key)).toEqual([
+                `${shared}a`,
+                `${shared}b`,
+            ]);
+            expect(first.nextKey).toBe(`${shared}b`);
+            const rest = await target.pageReservedItems(shared, {
+                limit: 2,
+                afterKey: first.nextKey,
+            });
+            expect(rest.items.map((item) => item.key)).toEqual([`${shared}c`]);
+            expect(await target.queryReservedItems(shared)).toHaveLength(3);
+        });
+
+        it('updates one only while its condition holds, and returns it', async () => {
+            const key = `${prefix()}item`;
+            const claim = (owner: string) =>
+                target.updateReservedItemIf(
+                    key,
+                    { set: { owner }, setIfAbsent: { since: 1 } },
+                    'attribute_not_exists(#o)',
+                    {},
+                    { '#o': 'owner' },
+                );
+
+            expect(await claim('first')).toMatchObject({
+                owner: 'first',
+                since: 1,
+            });
+            expect(await claim('second')).toBeNull();
+            expect(
+                await target.updateReservedItemIf(
+                    key,
+                    { set: { since: 2 }, remove: ['owner'] },
+                    '#o = :o',
+                    { ':o': 'first' },
+                    { '#o': 'owner' },
+                ),
+            ).toEqual(
+                expect.not.objectContaining({ owner: expect.anything() }),
+            );
+            expect(await target.getReservedItem(key)).toMatchObject({
+                since: 2,
+            });
+        });
     });
 
     describe('expireAt / expire', () => {
@@ -1370,6 +1579,18 @@ describe('SystemKVStore', () => {
             );
 
             expect(result.res).toEqual({ a: { owner: 1, other: 3 } });
+        });
+
+        it('rejects a single value over the size limit', async () => {
+            await expect(
+                target.update(
+                    {
+                        key: 'big-path',
+                        pathAndValueMap: { a: 'a'.repeat(400 * 1024) },
+                    },
+                    opts,
+                ),
+            ).rejects.toMatchObject({ statusCode: 400, code: 'value_too_large' });
         });
 
         it('sets a top-level path on a fresh key', async () => {

@@ -19,12 +19,13 @@
 
 import { HttpError } from '../../core/http/HttpError.js';
 import { Context } from '../../core/context.js';
+import { claimCountedRateLimit } from '../../core/http/middleware/rateLimit.js';
 import {
     DEFAULT_FREE_SUBSCRIPTION,
     DEFAULT_TEMP_SUBSCRIPTION,
 } from '../../services/metering/consts.js';
 import { PuterDriver } from '../types.js';
-import type { Actor } from '../../core/actor.js';
+import { type Actor, isAccountContext, isAppActor } from '../../core/actor.js';
 import type { DriverConcurrentConfig, DriverRateLimitConfig } from '../meta.js';
 import {
     APP_DATA_KV_METHOD_OPS,
@@ -35,6 +36,7 @@ import {
 import {
     KV_GLOBAL_APP_KEY,
     KV_MAX_KEY_BYTES,
+    KvPrivateEntryError,
     kvNamespace,
     type KVOpts,
     type KVUsage,
@@ -55,8 +57,11 @@ import {
     sealCursor,
     unsealCursor,
 } from '../../util/pagination.js';
+import { predatesApp } from '../../util/appGeneration.js';
 import { KV_COSTS } from './costs.js';
 import {
+    KV_HANDLE_NAMESPACE_BUDGET,
+    KV_HANDLE_WRITE_UNIT_WEIGHT,
     KV_MAX_BATCH_PUT_ITEMS,
     KV_MAX_GET_KEYS,
     KV_MAX_LIST_LIMIT,
@@ -83,6 +88,8 @@ interface KvOptConfig {
  */
 type KvCallArgs = {
     optConfig?: KvOptConfig;
+    /** `list` only: what the listing returns. */
+    as?: unknown;
     expireAt?: unknown;
     ttl?: unknown;
 };
@@ -91,11 +98,23 @@ type KvCallArgs = {
  * Store options plus, for a call through a share handle, the handle and its
  * region's prefix: keys go in under it and come back out relative to it.
  */
-type DriverKvOpts = KVOpts & { handle?: string; handlePrefix?: string };
+type DriverKvOpts = KVOpts & {
+    handle?: string;
+    handlePrefix?: string;
+    /** Set when the call spends from a namespace's handle budget. */
+    handleBudget?: HandleBudget;
+};
+
+/** The budgets a holder's call through a handle spends from. */
+interface HandleBudget {
+    /** Every holder of a share into the namespace together. */
+    namespace: string;
+    /** This holder alone, within the namespace. */
+    holder: string;
+}
 
 type KvListResult =
-    | unknown[]
-    | { items: unknown[]; cursor?: string; total?: number };
+    unknown[] | { items: unknown[]; cursor?: string; total?: number };
 
 /**
  * A listing of another namespace, cross-app or through a handle: what its
@@ -162,6 +181,43 @@ const handlePatternInvalid = (): HttpError =>
         `kv: a pattern used with a share handle may be at most ${KV_HANDLE_KEY_MAX_BYTES} bytes`,
         { legacyCode: 'kv_handle_key_invalid' },
     );
+
+/** The holder's budget in the namespace, or the namespace's, is used up. */
+const handleBudgetSpent = (): HttpError =>
+    new HttpError(429, 'Too many requests.', {
+        legacyCode: 'too_many_requests',
+    });
+
+/** The budgets a holder's calls into `namespace` spend from. */
+const handleBudget = (
+    namespace: string,
+    holderUserId: number,
+): HandleBudget => ({
+    namespace: `kv:handles:${namespace}`,
+    holder: `kv:handles:${namespace}:holder:${holderUserId}`,
+});
+
+/** Spend `units` from a budget, and say whether any of them fit. */
+const spendHandleBudget = async (
+    key: string,
+    limit: number,
+    units: number,
+): Promise<boolean> =>
+    (await claimCountedRateLimit(
+        key,
+        limit,
+        KV_HANDLE_NAMESPACE_BUDGET.window,
+        units,
+    )) > 0;
+
+/**
+ * Whether a share's grant can answer for this actor at all: the holder's own
+ * account, or the app whose data is shared. Any other caller is refused as if
+ * the handle weren't there.
+ */
+const onShareSurface = (actor: Actor, appUid: string): boolean =>
+    isAccountContext(actor) ||
+    (isAppActor(actor) && actor.effectiveApp?.uid === appUid);
 
 const invalidCursor = (): HttpError =>
     new HttpError(400, 'invalid kv: cursor', { legacyCode: 'bad_request' });
@@ -330,7 +386,8 @@ export class KVStoreDriver extends PuterDriver {
 
     /**
      * Run one store call. Through a handle, an error naming a stored key names
-     * the caller's relative key instead.
+     * the caller's relative key instead, and a write refused for a private
+     * entry gets the refusal any call the handle doesn't allow gets.
      */
     async #inRegion<T>(
         opts: DriverKvOpts,
@@ -341,6 +398,7 @@ export class KVStoreDriver extends PuterDriver {
         try {
             return await call();
         } catch (err) {
+            if (err instanceof KvPrivateEntryError) throw handleAccessDenied();
             throw relativizeError(err, opts.handlePrefix, keys);
         }
     }
@@ -404,7 +462,7 @@ export class KVStoreDriver extends PuterDriver {
         if (this.config.kv?.shareHandles !== true) throw kvHandlesDisabled();
 
         const optConfig = args.optConfig ?? {};
-        const level = kvShareLevelForMethod(method);
+        const level = kvShareLevelForMethod(method, args);
         if (optConfig.appUuid || optConfig.disableSharing)
             throw handleOptionInvalid(
                 'kv: `handle` cannot be combined with `appUuid` or `disableSharing`',
@@ -434,11 +492,31 @@ export class KVStoreDriver extends PuterDriver {
         if (userId !== row.granteeUserId && userId !== row.ownerUserId)
             throw handleNotFound();
 
-        // Side by side, so the app lookup costs no round trip of its own.
+        // The holder's own budget goes before the grant lookups, so throttled
+        // retries cost none. It only counts the holder's own calls, so it says
+        // nothing about the namespace. The owner spends no handle budget.
+        const { limit, perHolder } = KV_HANDLE_NAMESPACE_BUDGET;
+        const budget =
+            userId === row.ownerUserId
+                ? undefined
+                : handleBudget(kvNamespace(ownerUuid, row.appUid), userId);
+        const holderFirst =
+            budget !== undefined && onShareSurface(actor, row.appUid);
+        if (
+            holderFirst &&
+            !(await spendHandleBudget(budget.holder, perHolder, 1))
+        )
+            throw handleBudgetSpent();
+
+        // Side by side, so the app lookup costs no round trip of its own. A
+        // handle older than its app was made for an earlier app under the
+        // same uid, and is gone with it.
         const [appGone, allowed] = await Promise.all([
             row.appUid === KV_GLOBAL_APP_KEY
                 ? false
-                : this.stores.app.getByUid(row.appUid).then((app) => !app),
+                : this.stores.app
+                      .getByUid(row.appUid)
+                      .then((app) => !app || predatesApp(row.createdAt, app)),
             this.services.permission.check(
                 actor,
                 kvSharePermission(ownerUuid, row.appUid, row.keyPrefix, level),
@@ -465,6 +543,17 @@ export class KVStoreDriver extends PuterDriver {
             Buffer.byteLength(row.keyPrefix, 'utf8') > KV_SHARE_PREFIX_MAX_BYTES
         )
             throw handleAccessDenied();
+        // The namespace's budget tells how busy other holders are, so only a
+        // caller the grant admits may hear it. `#meter` spends the rest.
+        if (budget) {
+            if (
+                !holderFirst &&
+                !(await spendHandleBudget(budget.holder, perHolder, 1))
+            )
+                throw handleBudgetSpent();
+            if (!(await spendHandleBudget(budget.namespace, limit, 1)))
+                throw handleBudgetSpent();
+        }
 
         return {
             actor,
@@ -472,6 +561,7 @@ export class KVStoreDriver extends PuterDriver {
             namespaceAppUuid: row.appUid,
             handle,
             handlePrefix: row.keyPrefix,
+            ...(budget ? { handleBudget: budget } : {}),
         };
     }
 
@@ -553,8 +643,7 @@ export class KVStoreDriver extends PuterDriver {
         const decoded = decodeCursor(cursor);
         const reverse = decoded?.reverse === true;
         const position = (reverse ? decoded?.key : decoded) as
-            | { namespace?: unknown; key?: unknown }
-            | undefined;
+            { namespace?: unknown; key?: unknown } | undefined;
         if (position?.namespace !== listing.namespace) throw outsideRegion();
         const key = this.#relativeKey(position.key, listing.prefix);
         return sealCursor(
@@ -672,7 +761,23 @@ export class KVStoreDriver extends PuterDriver {
         }
     }
 
-    #meter(actor: Actor | undefined, usage: KVUsage): void {
+    /**
+     * Bill the caller for what the call consumed. A holder's call through a
+     * handle also spends it from its budgets, past the unit admission took.
+     */
+    #meter(opts: DriverKvOpts, usage: KVUsage): void {
+        const budget = opts.handleBudget;
+        if (budget) {
+            const units = Math.ceil(
+                usage.read + usage.write * KV_HANDLE_WRITE_UNIT_WEIGHT,
+            );
+            if (units > 1) {
+                const { limit, perHolder } = KV_HANDLE_NAMESPACE_BUDGET;
+                void spendHandleBudget(budget.holder, perHolder, units - 1);
+                void spendHandleBudget(budget.namespace, limit, units - 1);
+            }
+        }
+        const actor = opts.actor;
         if (!actor) return;
         const metering = this.services.metering;
         if (usage.read > 0) {
@@ -750,7 +855,7 @@ export class KVStoreDriver extends PuterDriver {
                     opts,
                 ),
             );
-            this.#meter(opts.actor, usage);
+            this.#meter(opts, usage);
             return res;
         }
 
@@ -758,7 +863,7 @@ export class KVStoreDriver extends PuterDriver {
         const { res, usage } = await this.#inRegion(opts, [coerced], () =>
             this.stores.kv.get({ key: this.#storeKey(coerced, opts) }, opts),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -793,7 +898,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -859,7 +964,7 @@ export class KVStoreDriver extends PuterDriver {
                     opts,
                 ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -872,7 +977,7 @@ export class KVStoreDriver extends PuterDriver {
         const { res, usage } = await this.#inRegion(opts, [coerced], () =>
             this.stores.kv.del({ key: this.#storeKey(coerced, opts) }, opts),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -928,7 +1033,7 @@ export class KVStoreDriver extends PuterDriver {
             },
             opts,
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         if (!listing) return res;
         return this.#foreignResult(res as KvListResult, args.as, listing);
     }
@@ -936,7 +1041,7 @@ export class KVStoreDriver extends PuterDriver {
     async flush(args: { optConfig?: KvOptConfig }): Promise<boolean> {
         const opts = await this.#opts('flush', args);
         const { res, usage } = await this.stores.kv.flush(opts);
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -964,7 +1069,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -992,7 +1097,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -1017,7 +1122,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -1039,7 +1144,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -1066,7 +1171,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -1091,7 +1196,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         return res;
     }
 
@@ -1113,7 +1218,7 @@ export class KVStoreDriver extends PuterDriver {
                 opts,
             ),
         );
-        this.#meter(opts.actor, usage);
+        this.#meter(opts, usage);
         // The result is the entry's value, so a delete-only grant gets none. A
         // handle's `write` level reads too.
         if (

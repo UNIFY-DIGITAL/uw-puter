@@ -186,6 +186,8 @@ const PATH_CLEANER_REGEX = /[^A-Za-z0-9_]/g;
 // is bounded; cursors are the recommended way to page.
 const MAX_LIST_OFFSET = 5000;
 const MAX_FILL_PAGES = 10;
+/** Items one purge query reads before deleting them. */
+const PURGE_PAGE_ITEMS = 1000;
 /** Most items one query reads while a foreign listing skips hidden entries. */
 const MAX_HIDDEN_SKIP_READ = 1000;
 // Cache keys carried by one invalidation broadcast. A peer applies them in a
@@ -269,10 +271,17 @@ const notPrivateCondition = (now: number) => {
     };
 };
 
-const privateEntryError = (): HttpError =>
-    new HttpError(403, 'kv: this entry is private to the app that wrote it', {
-        legacyCode: 'forbidden',
-    });
+/**
+ * A write into a foreign namespace refused for landing on a private entry. A
+ * class of its own so a share's caller can be told something else.
+ */
+export class KvPrivateEntryError extends HttpError {
+    constructor() {
+        super(403, 'kv: this entry is private to the app that wrote it', {
+            legacyCode: 'forbidden',
+        });
+    }
+}
 
 /**
  * A timestamp at or before now is stored as `floor(now)` rather than as-is, so
@@ -481,7 +490,8 @@ const unsafeKeyError = (key: string, subject: string): HttpError =>
     });
 
 type PathToken =
-    { type: 'key'; value: string } | { type: 'index'; value: number };
+    | { type: 'key'; value: string }
+    | { type: 'index'; value: number };
 
 const invalidPathError = (): HttpError =>
     new HttpError(400, 'kv: path has invalid syntax', {
@@ -892,7 +902,7 @@ const assertValue = (value: unknown, rootLevel = 1, path?: string): void => {
         throw new HttpError(
             400,
             `kv: value exceeds ${MAX_VALUE_BYTES} byte limit`,
-            { legacyCode: 'bad_request' },
+            { code: 'value_too_large' },
         );
     }
 };
@@ -1650,19 +1660,38 @@ export class SystemKVStore extends PuterStore {
     async queryReservedItems<T extends Record<string, unknown>>(
         prefix: string,
     ): Promise<T[]> {
+        return (await this.pageReservedItems<T>(prefix, { limit: 0 })).items;
+    }
+
+    /**
+     * Up to `limit` reserved items whose key starts with `prefix`, in key order
+     * after `afterKey` (a `limit` of 0 reads one unbounded page). `nextKey` is
+     * where the next page starts, while more may remain. Expired rows are left
+     * out, as in {@link queryReservedItems}.
+     */
+    async pageReservedItems<T extends Record<string, unknown>>(
+        prefix: string,
+        { limit, afterKey }: { limit: number; afterKey?: string },
+    ): Promise<{ items: T[]; nextKey?: string }> {
         const now = Date.now() / 1000;
         const response = await this.clients.dynamo.query(
             this.tableName,
             { namespace: SYSTEM_NAMESPACE },
-            0,
-            undefined,
+            limit,
+            afterKey === undefined
+                ? undefined
+                : { namespace: SYSTEM_NAMESPACE, key: afterKey },
             '',
             false,
             { beginsWith: { key: 'key', value: prefix } },
         );
-        return ((response.Items ?? []) as T[]).filter(
-            (item) => !item.ttl || (item.ttl as number) > now,
-        );
+        const last = response.LastEvaluatedKey?.key;
+        return {
+            items: ((response.Items ?? []) as T[]).filter(
+                (item) => !item.ttl || (item.ttl as number) > now,
+            ),
+            ...(last === undefined ? {} : { nextKey: String(last) }),
+        };
     }
 
     /**
@@ -1760,6 +1789,104 @@ export class SystemKVStore extends PuterStore {
         }
     }
 
+    /**
+     * Update one reserved item, creating it when missing, if `condition` holds.
+     * `set` attributes are written outright, `setIfAbsent` ones only where the
+     * item doesn't carry them, and `remove` ones are dropped. Returns the item
+     * as it now stands, or `null` when the condition refused it. Condition
+     * tokens must not start with `#u` or `:u`.
+     */
+    async updateReservedItemIf<T extends Record<string, unknown>>(
+        key: string,
+        change: {
+            set?: Record<string, unknown>;
+            setIfAbsent?: Record<string, unknown>;
+            remove?: string[];
+        },
+        condition: string,
+        conditionValues: Record<string, unknown> = {},
+        conditionNames: Record<string, string> = {},
+    ): Promise<T | null> {
+        assertKey(key);
+        const names: Record<string, string> = { ...conditionNames };
+        const values: Record<string, unknown> = { ...conditionValues };
+        const setParts: string[] = [];
+        const removeParts: string[] = [];
+        let idx = 0;
+        const token = (attr: string) => {
+            const name = `#u${idx}`;
+            names[name] = attr;
+            return { name, value: `:u${idx++}` };
+        };
+        for (const [attr, value] of Object.entries(change.set ?? {})) {
+            const t = token(attr);
+            values[t.value] = value;
+            setParts.push(`${t.name} = ${t.value}`);
+        }
+        for (const [attr, value] of Object.entries(change.setIfAbsent ?? {})) {
+            const t = token(attr);
+            values[t.value] = value;
+            setParts.push(`${t.name} = if_not_exists(${t.name}, ${t.value})`);
+        }
+        for (const attr of change.remove ?? [])
+            removeParts.push(token(attr).name);
+        const expression = [
+            setParts.length > 0 ? `SET ${setParts.join(', ')}` : '',
+            removeParts.length > 0 ? `REMOVE ${removeParts.join(', ')}` : '',
+        ]
+            .filter(Boolean)
+            .join(' ');
+        if (!expression)
+            throw new Error('kv: a reserved update needs a change');
+
+        try {
+            const response = await this.clients.dynamo.update(
+                this.tableName,
+                { namespace: SYSTEM_NAMESPACE, key },
+                expression,
+                values,
+                names,
+                { condition },
+            );
+            return (response.Attributes as T | undefined) ?? null;
+        } catch (err) {
+            if (isConditionRefused(err)) return null;
+            throw err;
+        }
+    }
+
+    /**
+     * Delete one reserved item, conditional on an attribute the caller read
+     * still holding. False means the item changed or is already gone.
+     */
+    async deleteReservedItemIf(
+        key: string,
+        condition: string,
+        conditionValues: Record<string, unknown>,
+        conditionNames: Record<string, string> = {},
+    ): Promise<boolean> {
+        assertKey(key);
+        try {
+            await this.clients.dynamo.del(
+                this.tableName,
+                { namespace: SYSTEM_NAMESPACE, key },
+                {
+                    condition: {
+                        expression: condition,
+                        ...(Object.keys(conditionValues).length > 0
+                            ? { values: conditionValues }
+                            : {}),
+                        names: conditionNames,
+                    },
+                },
+            );
+            return true;
+        } catch (err) {
+            if (isConditionRefused(err)) return false;
+            throw err;
+        }
+    }
+
     // -- Public API ---------------------------------------------------
 
     /**
@@ -1796,7 +1923,8 @@ export class SystemKVStore extends PuterStore {
                 usage,
                 readUsage(
                     response.ConsumedCapacity?.CapacityUnits as
-                        number | undefined,
+                        | number
+                        | undefined,
                 ),
             );
         }
@@ -1804,7 +1932,7 @@ export class SystemKVStore extends PuterStore {
             response.Item?.[KV_PRIVATE_ATTR] &&
             !isExpiredTtl(response.Item.ttl, Date.now() / 1000)
         ) {
-            throw privateEntryError();
+            throw new KvPrivateEntryError();
         }
         // Returned rather than swallowed: the probe is a real read, and a caller
         // that did not pay for it is under-billed for the operation.
@@ -1858,7 +1986,7 @@ export class SystemKVStore extends PuterStore {
         const isPrivate = confirmedEntries.some(
             (entry) => entry?.noShare && !isExpiredTtl(entry.ttl, now),
         );
-        if (isPrivate) throw privateEntryError();
+        if (isPrivate) throw new KvPrivateEntryError();
         return addUsage(usage, recheckUsage);
     }
 
@@ -1876,7 +2004,8 @@ export class SystemKVStore extends PuterStore {
             );
             return writeUsage(
                 (response.ConsumedCapacity?.CapacityUnits as
-                    number | undefined) ?? 1,
+                    | number
+                    | undefined) ?? 1,
             );
         } catch (e) {
             if (!isConditionRefused(e)) throw e;
@@ -1923,7 +2052,8 @@ export class SystemKVStore extends PuterStore {
                     },
                 );
                 units = response.ConsumedCapacity?.CapacityUnits as
-                    number | undefined;
+                    | number
+                    | undefined;
             } else {
                 const expiry = ttlNumber(ttl);
                 const keep = Number.isFinite(expiry) && expiry !== 0;
@@ -1939,7 +2069,8 @@ export class SystemKVStore extends PuterStore {
                     { condition },
                 );
                 units = response.ConsumedCapacity?.CapacityUnits as
-                    number | undefined;
+                    | number
+                    | undefined;
             }
             usage = addUsage(usage, writeUsage(units ?? 1));
         } catch (e) {
@@ -2070,7 +2201,8 @@ export class SystemKVStore extends PuterStore {
                 fetched = response.Item ? [response.Item as KvCachedItem] : [];
                 fetchUnits = Number(
                     (response.ConsumedCapacity?.CapacityUnits as
-                        number | undefined) ?? 0,
+                        | number
+                        | undefined) ?? 0,
                 );
             }
 
@@ -2178,8 +2310,13 @@ export class SystemKVStore extends PuterStore {
             throw e;
         }
         if (response === null) {
-            if (onlyIfAbsent) return { res: false, usage: settleUsage };
-            throw privateEntryError();
+            if (!onlyIfAbsent) throw new KvPrivateEntryError();
+            // A share holder reads a private entry as absent, so `false` would
+            // confirm it; the holder gets the refusal a plain write gets.
+            const probeUsage = opts?.namespaceUser
+                ? await this.#assertNotPrivate(namespace, key, opts)
+                : emptyUsage();
+            return { res: false, usage: addUsage(settleUsage, probeUsage) };
         }
         await this.#committed(
             opts,
@@ -2316,7 +2453,12 @@ export class SystemKVStore extends PuterStore {
         const { response, usage: settleUsage } = condition
             ? await this.#writeUnlessRefused(namespace, key, del)
             : { response: await del(), usage: emptyUsage() };
-        if (response === null) throw privateEntryError();
+        if (response === null) {
+            // A share holder reads a private entry as absent, so deleting it
+            // answers as deleting a missing key does, and leaves it in place.
+            if (opts?.namespaceUser) return { res: true, usage: settleUsage };
+            throw new KvPrivateEntryError();
+        }
         await this.#committed(
             opts,
             namespace,
@@ -2367,7 +2509,8 @@ export class SystemKVStore extends PuterStore {
         );
 
         const old = response.Attributes as
-            { value?: unknown; ttl?: number } | undefined;
+            | { value?: unknown; ttl?: number }
+            | undefined;
         const now = Date.now() / 1000;
         const res =
             old === undefined || isExpiredTtl(old.ttl, now)
@@ -2380,7 +2523,8 @@ export class SystemKVStore extends PuterStore {
                 probeUsage,
                 writeUsage(
                     (response.ConsumedCapacity?.CapacityUnits as
-                        number | undefined) ?? 1,
+                        | number
+                        | undefined) ?? 1,
                 ),
             ),
         };
@@ -2477,7 +2621,9 @@ export class SystemKVStore extends PuterStore {
             | { key: string; value: unknown }[]
             | {
                   items:
-                      string[] | unknown[] | { key: string; value: unknown }[];
+                      | string[]
+                      | unknown[]
+                      | { key: string; value: unknown }[];
                   cursor?: string;
                   total?: number;
               }
@@ -2600,7 +2746,8 @@ export class SystemKVStore extends PuterStore {
                 usage,
                 readUsage(
                     (response.ConsumedCapacity?.CapacityUnits as
-                        number | undefined) ?? 1,
+                        | number
+                        | undefined) ?? 1,
                 ),
             );
             return response;
@@ -2617,7 +2764,8 @@ export class SystemKVStore extends PuterStore {
                 const skip = await runQuery(remaining, startKey, 'COUNT');
                 remaining -= Number(skip.Count ?? 0);
                 startKey = skip.LastEvaluatedKey as
-                    Record<string, unknown> | undefined;
+                    | Record<string, unknown>
+                    | undefined;
                 // No key means no data past this page, even when the offset
                 // landed exactly on its end; listing on would restart at the
                 // first key.
@@ -2652,7 +2800,8 @@ export class SystemKVStore extends PuterStore {
                     >),
                 );
                 nextKey = response.LastEvaluatedKey as
-                    Record<string, unknown> | undefined;
+                    | Record<string, unknown>
+                    | undefined;
                 pages++;
                 if (normalizedLimit === undefined) {
                     // Legacy full listing: follow continuation pages so the
@@ -2701,7 +2850,8 @@ export class SystemKVStore extends PuterStore {
                 const counted = await runQuery(0, countKey, 'COUNT');
                 total += Number(counted.Count ?? 0);
                 countKey = counted.LastEvaluatedKey as
-                    Record<string, unknown> | undefined;
+                    | Record<string, unknown>
+                    | undefined;
             } while (countKey);
         }
 
@@ -2732,54 +2882,129 @@ export class SystemKVStore extends PuterStore {
         let pageKey: Record<string, unknown> | undefined;
         try {
             do {
-                const response = await this.clients.dynamo.query(
-                    this.tableName,
-                    { namespace },
-                    0,
-                    pageKey,
-                );
-                usage = addUsage(
-                    usage,
-                    readUsage(
-                        response.ConsumedCapacity?.CapacityUnits as
-                            number | undefined,
-                    ),
-                );
-                const keys = (response.Items ?? []).map((entry) =>
-                    String(entry.key),
-                );
-                if (keys.length > 0) {
-                    try {
-                        const deleted = await this.clients.dynamo.batchDel(
-                            keys.map((key) => ({
-                                table: this.tableName,
-                                key: { namespace, key },
-                            })),
-                        );
-                        usage = addUsage(
-                            usage,
-                            writeUsage(
-                                deleted.ConsumedCapacity?.reduce(
-                                    (acc, curr) =>
-                                        acc + Number(curr.CapacityUnits ?? 0),
-                                    0,
-                                ) ?? 0,
-                            ),
-                        );
-                    } finally {
-                        // A failed batch may still have deleted some of
-                        // these, so their cached reads go either way.
-                        await this.#invalidate(namespace, keys);
-                    }
-                }
-                pageKey = response.LastEvaluatedKey as
-                    Record<string, unknown> | undefined;
+                const page = await this.#deletePage(namespace, pageKey, {
+                    consistent: false,
+                });
+                usage = addUsage(usage, page.usage);
+                pageKey = page.pageKey;
             } while (pageKey);
         } finally {
             this.#emitMutation(opts, namespace, [], 'flush');
         }
 
         return { res: true, usage };
+    }
+
+    /**
+     * Delete up to `maxItems` items of one user's app namespace, as the
+     * platform: no mutation events and no usage. Idempotent; `done` once the
+     * namespace is empty. `stillWanted` is asked before each page is deleted,
+     * after its keys are read, and a no ends the call with `stopped`: what's
+     * written once it would say no is kept.
+     */
+    async purgeNamespace(
+        namespace: string,
+        {
+            maxItems,
+            stillWanted,
+        }: { maxItems: number; stillWanted?: () => Promise<boolean> },
+    ): Promise<{ deleted: number; done: boolean; stopped?: boolean }> {
+        const parsed = parseKvNamespace(namespace);
+        if (
+            !parsed ||
+            parsed.userUuid === SYSTEM_ACTOR_UUID ||
+            kvNamespace(parsed.userUuid, parsed.appUid) !== namespace
+        )
+            throw new Error(`kv: not a user namespace: ${namespace}`);
+        if (!Number.isInteger(maxItems) || maxItems < 1)
+            throw new Error('kv: maxItems must be a positive integer');
+
+        let deleted = 0;
+        let pageKey: Record<string, unknown> | undefined;
+        while (deleted < maxItems) {
+            const page = await this.#deletePage(namespace, pageKey, {
+                limit: Math.min(maxItems - deleted, PURGE_PAGE_ITEMS),
+                consistent: true,
+                beforeDelete: stillWanted,
+            });
+            if (page.stopped) return { deleted, done: false, stopped: true };
+            deleted += page.deleted;
+            pageKey = page.pageKey;
+            if (!pageKey) return { deleted, done: true };
+        }
+        return { deleted, done: false };
+    }
+
+    /**
+     * One page of `namespace` deleted, starting after `pageKey`. Reads only the
+     * keys; `pageKey` comes back while more items may remain. A purge reads
+     * strongly consistent, so a stale empty page can't end it early; a flush
+     * keeps the eventually consistent read its usage is billed on.
+     */
+    async #deletePage(
+        namespace: string,
+        pageKey: Record<string, unknown> | undefined,
+        {
+            limit = 0,
+            consistent,
+            beforeDelete,
+        }: {
+            limit?: number;
+            consistent: boolean;
+            beforeDelete?: () => Promise<boolean>;
+        },
+    ): Promise<{
+        deleted: number;
+        usage: KVUsage;
+        pageKey?: Record<string, unknown>;
+        stopped?: boolean;
+    }> {
+        const response = await this.clients.dynamo.query(
+            this.tableName,
+            { namespace },
+            limit,
+            pageKey,
+            '',
+            consistent,
+            { projection: ['namespace', 'key'] },
+        );
+        let usage = readUsage(
+            response.ConsumedCapacity?.CapacityUnits as number | undefined,
+        );
+        const keys = (response.Items ?? []).map((entry) => String(entry.key));
+        if (keys.length > 0 && beforeDelete && !(await beforeDelete()))
+            return { deleted: 0, usage, stopped: true };
+        if (keys.length > 0) {
+            try {
+                const deleted = await this.clients.dynamo.batchDel(
+                    keys.map((key) => ({
+                        table: this.tableName,
+                        key: { namespace, key },
+                    })),
+                );
+                usage = addUsage(
+                    usage,
+                    writeUsage(
+                        deleted.ConsumedCapacity?.reduce(
+                            (acc, curr) =>
+                                acc + Number(curr.CapacityUnits ?? 0),
+                            0,
+                        ) ?? 0,
+                    ),
+                );
+            } finally {
+                // A failed batch may still have deleted some of these, so
+                // their cached reads go either way.
+                await this.#invalidate(namespace, keys);
+            }
+        }
+        return {
+            deleted: keys.length,
+            usage,
+            pageKey: response.LastEvaluatedKey as
+                | Record<string, unknown>
+                | undefined,
+        };
     }
 
     async expireAt(
@@ -3161,7 +3386,8 @@ export class SystemKVStore extends PuterStore {
             );
             const units =
                 (response.ConsumedCapacity?.CapacityUnits as
-                    number | undefined) ?? 1;
+                    | number
+                    | undefined) ?? 1;
             // A legacy ttl the condition couldn't read: the row was already expired.
             const removedTtl = response.Attributes?.ttl;
             if (
@@ -3429,7 +3655,8 @@ export class SystemKVStore extends PuterStore {
                 resetUsage,
                 writeUsage(
                     (response.ConsumedCapacity?.CapacityUnits as
-                        number | undefined) ?? 1,
+                        | number
+                        | undefined) ?? 1,
                 ),
             ),
             isPrivate: Boolean(response.Attributes?.[KV_PRIVATE_ATTR]),

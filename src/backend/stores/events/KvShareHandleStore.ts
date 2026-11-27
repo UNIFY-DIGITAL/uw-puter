@@ -19,16 +19,22 @@
 
 import {
     KV_SHARE_ACCESS_LEVELS,
+    kvHandleIdKind,
     kvShareRoot,
     mintKvHandleId,
     type KvShareAccess,
 } from '../../services/kvShare/kvShares.js';
+import {
+    APP_CLOCK_SKEW_SECONDS,
+    predatesApp,
+} from '../../util/appGeneration.js';
 import { BoundedTtlMap } from '../../util/boundedTtlMap.js';
 import {
     keysetPage,
     openIdCursor,
     type PageResult,
 } from '../../util/pagination.js';
+import { KV_GLOBAL_APP_KEY } from '../systemKv/SystemKVStore.js';
 import { PuterStore } from '../types.js';
 import { assertColumnWidths, KV_SHARE_HANDLE_WIDTHS } from './columnWidths.js';
 
@@ -62,6 +68,8 @@ export interface KvShareHandle {
     permission: string;
     /** Owner-set text the holder is shown, or `null`. */
     label: string | null;
+    /** Whether the two parties may notify each other through the handle. */
+    notify: boolean;
     createdAt: number;
     revokedAt: number | null;
     /** `null` while live, and on rows retired before this was recorded. */
@@ -84,13 +92,15 @@ export interface HeldKvShareHandle {
     appUid: string;
     access: KvShareAccess;
     label: string | null;
+    notify: boolean;
     createdAt: number;
 }
 
-/** What a level or label change writes; an absent field is left alone. */
+/** What a level, label or notify change writes; an absent field is left alone. */
 export interface KvShareHandleUpdate {
     permission?: string;
     label?: string | null;
+    notify?: boolean;
 }
 
 export interface KvShareHandleListOptions {
@@ -101,6 +111,15 @@ export interface KvShareHandleListOptions {
     appUid?: string | null;
 }
 
+/** Which of an owner's handles a listing returns. */
+export const KV_SHARE_OWNER_LIST_STATES = ['live', 'revoked', 'all'] as const;
+export type KvShareOwnerListState = (typeof KV_SHARE_OWNER_LIST_STATES)[number];
+
+export interface KvShareOwnerListOptions extends KvShareHandleListOptions {
+    /** Defaults to `all`. */
+    state?: KvShareOwnerListState;
+}
+
 export interface MintKvShareHandleInput {
     ownerUserId: number;
     granteeUserId: number;
@@ -108,6 +127,7 @@ export interface MintKvShareHandleInput {
     keyPrefix: string;
     permission: string;
     label?: string | null;
+    notify?: boolean;
 }
 
 export interface FindLiveKvShareHandleInput {
@@ -120,12 +140,36 @@ export interface FindLiveKvShareHandleInput {
 /** Handle cache bounds: live rows, and recently missed names. */
 const LIVE_CACHE_TTL_MS = 60_000;
 const MISS_CACHE_TTL_MS = 5_000;
-const LIVE_CACHE_MAX_ENTRIES = 10_000;
+const LIVE_CACHE_MAX_ENTRIES = 50_000;
+const MISS_CACHE_MAX_ENTRIES = 10_000;
+
+/**
+ * How long a handle or owner is read from the primary after a forget. A replica
+ * that has not caught up with the change would otherwise put the old row
+ * straight back in the cache.
+ */
+const FORGOTTEN_TTL_MS = LIVE_CACHE_TTL_MS;
+const FORGOTTEN_MAX_ENTRIES = 50_000;
+
+const LIVE_QUERY =
+    'SELECT h.`handle`, h.`owner_user_id`, h.`grantee_user_id`, ' +
+    'h.`app_uid`, h.`key_prefix`, h.`permission`, h.`notify`, ' +
+    'h.`created_at`, h.`revoked_at`, h.`revoked_by`, ' +
+    'u.`uuid` AS `owner_uuid`, u.`suspended` AS `owner_suspended` ' +
+    `FROM \`${TABLE}\` h JOIN \`user\` u ON u.\`id\` = h.\`owner_user_id\` ` +
+    'WHERE h.`handle` = ?';
+
+/** Handles one cross-node forget carries. */
+const FORGET_BATCH = 500;
 
 /** Rows one app-deletion retire pass takes. */
 export const KV_HANDLE_RETIRE_BATCH = 500;
 
 const nowSeconds = (): number => Math.floor(Date.now() / 1000);
+
+/** Whether a forget stamped `at` came after the one numbered `before`. */
+const forgottenSince = (at: number | undefined, before: number): boolean =>
+    at !== undefined && at > before;
 
 const toRevokedBy = (value: unknown): KvShareRevokedBy | null =>
     REVOKED_BY.includes(value as KvShareRevokedBy)
@@ -143,6 +187,7 @@ const toRow = (row: Record<string, unknown>): KvShareHandle => ({
         row.label === null || row.label === undefined
             ? null
             : String(row.label),
+    notify: Number(row.notify) === 1,
     createdAt: Number(row.created_at) || 0,
     revokedAt: row.revoked_at === null ? null : Number(row.revoked_at),
     revokedBy: toRevokedBy(row.revoked_by),
@@ -150,8 +195,8 @@ const toRow = (row: Record<string, unknown>): KvShareHandle => ({
 
 const SELECT_COLUMNS =
     '`handle`, `owner_user_id`, `grantee_user_id`, `app_uid`, ' +
-    '`key_prefix`, `permission`, `label`, `created_at`, `revoked_at`, ' +
-    '`revoked_by`';
+    '`key_prefix`, `permission`, `label`, `notify`, `created_at`, ' +
+    '`revoked_at`, `revoked_by`';
 
 /**
  * The level as SQL reads it off the grant's root, so the holder listing can
@@ -179,19 +224,32 @@ export class KvShareHandleStore extends PuterStore {
         ttlMs: LIVE_CACHE_TTL_MS,
     });
     readonly #missing = new BoundedTtlMap<string, true>({
-        maxEntries: LIVE_CACHE_MAX_ENTRIES,
+        maxEntries: MISS_CACHE_MAX_ENTRIES,
         ttlMs: MISS_CACHE_TTL_MS,
     });
+    /** Handles and owners forgotten lately, each with the forget's sequence. */
+    readonly #forgotten = new BoundedTtlMap<string, number>({
+        maxEntries: FORGOTTEN_MAX_ENTRIES,
+        ttlMs: FORGOTTEN_TTL_MS,
+    });
+    readonly #forgottenOwners = new BoundedTtlMap<number, number>({
+        maxEntries: FORGOTTEN_MAX_ENTRIES,
+        ttlMs: FORGOTTEN_TTL_MS,
+    });
+    #forgets = 0;
+    /** Reads in flight, so concurrent misses on one handle share a query. */
+    readonly #reading = new Map<string, Promise<LiveKvShareHandle | null>>();
 
     async mint(input: MintKvShareHandleInput): Promise<KvShareHandle> {
         const row: KvShareHandle = {
-            handle: mintKvHandleId(),
+            handle: mintKvHandleId(this.config.jwt_secret_v2),
             ownerUserId: input.ownerUserId,
             granteeUserId: input.granteeUserId,
             appUid: input.appUid,
             keyPrefix: input.keyPrefix,
             permission: input.permission,
             label: input.label ?? null,
+            notify: input.notify === true,
             createdAt: nowSeconds(),
             revokedAt: null,
             revokedBy: null,
@@ -211,6 +269,7 @@ export class KvShareHandleStore extends PuterStore {
             key_prefix: row.keyPrefix,
             permission: row.permission,
             label: row.label,
+            notify: row.notify ? 1 : 0,
             created_at: row.createdAt,
             revoked_at: null,
         });
@@ -218,51 +277,192 @@ export class KvShareHandleStore extends PuterStore {
         return row;
     }
 
+    override onServerStart(): void {
+        // Our own emit already forgot locally before it went out.
+        this.clients.event.on(
+            'outer.pubsub.kv.share.forget',
+            (_key, data, meta) => {
+                if (!(meta as { from_outside?: boolean })?.from_outside) return;
+                const handles = (data as { handles?: unknown })?.handles;
+                if (!Array.isArray(handles)) return;
+                for (const handle of handles)
+                    if (typeof handle === 'string') this.#forget(handle);
+            },
+        );
+
+        // Cached rows carry their owner's suspension, so a change to it drops
+        // them here and on every other node.
+        const ownerChanged = (_key: string, data: { userId?: unknown }) => {
+            const ownerUserId = Number(data?.userId);
+            if (!Number.isInteger(ownerUserId) || ownerUserId <= 0) return;
+            this.#forgetOwner(ownerUserId);
+            try {
+                this.clients.event.emit(
+                    'outer.pubsub.kv.share.forgetOwner',
+                    { ownerUserId },
+                    {},
+                );
+            } catch {
+                // The cache's TTL covers a node the broadcast misses.
+            }
+        };
+        this.clients.event.on('user.suspended', ownerChanged);
+        this.clients.event.on('user.unsuspended', ownerChanged);
+        this.clients.event.on(
+            'outer.pubsub.kv.share.forgetOwner',
+            (_key, data, meta) => {
+                if (!(meta as { from_outside?: boolean })?.from_outside) return;
+                const ownerUserId = Number(
+                    (data as { ownerUserId?: unknown })?.ownerUserId,
+                );
+                if (Number.isInteger(ownerUserId) && ownerUserId > 0)
+                    this.#forgetOwner(ownerUserId);
+            },
+        );
+    }
+
+    /** Drop this node's cached live rows owned by one user. */
+    #forgetOwner(ownerUserId: number): void {
+        this.#forgottenOwners.set(ownerUserId, ++this.#forgets);
+        this.#live.deleteWhere(({ row }) => row.ownerUserId === ownerUserId);
+        // A read's owner is only known once it returns.
+        this.#reading.clear();
+    }
+
     /**
      * A live handle and its owner's state, cached in-process (hits up to 60 s,
      * misses 5 s). Authority is the grant, checked on every call, so a stale
      * row only keeps an address alive a little longer, never widens it.
+     *
+     * A forged id is refused without a read. Only a signed id falls back to the
+     * primary on a replica miss: that is for read-after-mint, and legacy ids
+     * are no longer minted. A handle or owner forgotten in the last minute,
+     * before or during the read, is read from the primary too. Concurrent
+     * misses on one handle share one read. A handle older than its app reads as
+     * gone.
      */
     async getLive(handle: string): Promise<LiveKvShareHandle | null> {
+        const kind = kvHandleIdKind(handle, this.config.jwt_secret_v2);
+        if (kind === null) return null;
         const cached = this.#live.get(handle);
         if (cached) return cached;
         if (this.#missing.has(handle)) return null;
 
-        const query =
-            'SELECT h.`handle`, h.`owner_user_id`, h.`grantee_user_id`, ' +
-            'h.`app_uid`, h.`key_prefix`, h.`permission`, h.`created_at`, ' +
-            'h.`revoked_at`, h.`revoked_by`, ' +
-            'u.`uuid` AS `owner_uuid`, u.`suspended` AS `owner_suspended` ' +
-            `FROM \`${TABLE}\` h JOIN \`user\` u ON u.\`id\` = h.\`owner_user_id\` ` +
-            'WHERE h.`handle` = ?';
-        let rows = await this.clients.db.read(query, [handle]);
-        if (rows.length === 0)
-            rows = await this.clients.db.pread(query, [handle]);
+        const reading = this.#reading.get(handle);
+        if (reading) return reading;
+        const read = this.#readLive(handle, kind);
+        this.#reading.set(handle, read);
+        try {
+            return await read;
+        } finally {
+            if (this.#reading.get(handle) === read)
+                this.#reading.delete(handle);
+        }
+    }
+
+    async #readLive(
+        handle: string,
+        kind: 'signed' | 'legacy',
+    ): Promise<LiveKvShareHandle | null> {
+        let before = this.#forgets;
+        const primary = this.#forgotten.has(handle);
+        let rows = primary
+            ? await this.clients.db.pread(LIVE_QUERY, [handle])
+            : await this.clients.db.read(LIVE_QUERY, [handle]);
+        if (
+            !primary &&
+            ((rows.length === 0 && kind === 'signed') ||
+                this.#forgotten.has(handle) ||
+                this.#forgottenOwners.has(Number(rows[0]?.owner_user_id)))
+        ) {
+            before = this.#forgets;
+            rows = await this.clients.db.pread(LIVE_QUERY, [handle]);
+        }
+
+        // A forget that landed during the read, or the app lookup after it,
+        // may postdate what it returned.
+        const cacheable = () =>
+            !forgottenSince(this.#forgotten.get(handle), before) &&
+            !forgottenSince(
+                this.#forgottenOwners.get(Number(rows[0]?.owner_user_id)),
+                before,
+            );
 
         const found = rows[0];
         if (!found || found.revoked_at !== null || !found.owner_uuid) {
-            this.#missing.set(handle, true);
+            if (cacheable()) this.#missing.set(handle, true);
             return null;
         }
         const { label: _label, ...row } = toRow({ ...found, label: null });
+        if (await this.predatesItsApp(row)) {
+            if (cacheable()) this.#missing.set(handle, true);
+            return null;
+        }
         const live: LiveKvShareHandle = {
             row,
             ownerUuid: String(found.owner_uuid),
             ownerSuspended: Boolean(Number(found.owner_suspended ?? 0)),
         };
-        this.#live.set(handle, live);
+        if (cacheable()) this.#live.set(handle, live);
         return live;
     }
 
-    /** Drops this node's cached copy; other nodes converge within the TTL. */
+    /**
+     * Whether a handle was made for an earlier app under its app's uid: an
+     * origin-derived uid comes back verbatim when the app is registered again,
+     * and its predecessor's handles must not reach the new one. Such a handle
+     * reads as gone wherever a handle is resolved.
+     */
+    async predatesItsApp(
+        row: Pick<KvShareHandle, 'appUid' | 'createdAt'>,
+    ): Promise<boolean> {
+        if (row.appUid === KV_GLOBAL_APP_KEY) return false;
+        return predatesApp(
+            row.createdAt,
+            await this.stores.app.getByUid(row.appUid),
+        );
+    }
+
+    /**
+     * SQL that holds for a handle older than its app, the same rule as
+     * {@link predatesItsApp}. Binds one parameter, the clock-skew allowance.
+     */
+    #predatesAppSql(): string {
+        const created = this.clients.db.unixSecondsSql('`apps`.`timestamp`');
+        return (
+            'EXISTS (SELECT 1 FROM `apps` WHERE ' +
+            `\`apps\`.\`uid\` = \`${TABLE}\`.\`app_uid\` AND ` +
+            `${created} - ? > \`${TABLE}\`.\`created_at\`)`
+        );
+    }
+
     #forget(handle: string): void {
+        this.#forgotten.set(handle, ++this.#forgets);
         this.#live.delete(handle);
         this.#missing.delete(handle);
+        this.#reading.delete(handle);
+    }
+
+    /** Drops the cached copies on this node and every other one. */
+    #forgetEverywhere(handles: readonly string[]): void {
+        for (const handle of handles) this.#forget(handle);
+        for (let at = 0; at < handles.length; at += FORGET_BATCH) {
+            try {
+                this.clients.event.emit(
+                    'outer.pubsub.kv.share.forget',
+                    { handles: handles.slice(at, at + FORGET_BATCH) },
+                    {},
+                );
+            } catch {
+                // The cache's TTL covers a node the broadcast misses.
+            }
+        }
     }
 
     /**
      * Live handles this owner is holding out — in total, and in the namespace a
-     * mint is naming. Both ceilings read off one count, over the owner index.
+     * mint is naming. Both ceilings read off one count, covered by the
+     * `(owner_user_id, revoked_at, app_uid)` index.
      */
     async countLiveForOwner(
         ownerUserId: number,
@@ -281,11 +481,49 @@ export class KvShareHandleStore extends PuterStore {
         };
     }
 
+    /** Live handles this owner holds out to one holder, over the pair index. */
+    async countLiveForOwnerAndGrantee(
+        ownerUserId: number,
+        granteeUserId: number,
+    ): Promise<number> {
+        const [row] = await this.clients.db.pread(
+            `SELECT COUNT(*) AS \`total\` FROM \`${TABLE}\` ` +
+                'WHERE `owner_user_id` = ? AND `grantee_user_id` = ? ' +
+                'AND `revoked_at` IS NULL',
+            [ownerUserId, granteeUserId],
+        );
+        return Number(row?.total ?? 0);
+    }
+
+    /**
+     * Delete up to `limit` rows retired before `cutoff` (unix seconds) and
+     * report how many went. Ids first, then a delete by id, since not every
+     * engine takes `LIMIT` on a delete or in an `IN` subquery.
+     */
+    async deleteRevokedBefore(cutoff: number, limit: number): Promise<number> {
+        const rows = await this.clients.db.pread(
+            `SELECT \`id\` FROM \`${TABLE}\` ` +
+                'WHERE `revoked_at` IS NOT NULL AND `revoked_at` < ? ' +
+                'ORDER BY `revoked_at` LIMIT ?',
+            [cutoff, limit],
+        );
+        if (rows.length === 0) return 0;
+        const ids = rows.map((row) => Number(row.id));
+        const result = await this.clients.db.write(
+            `DELETE FROM \`${TABLE}\` ` +
+                `WHERE \`id\` IN (${ids.map(() => '?').join(', ')}) ` +
+                'AND `revoked_at` IS NOT NULL AND `revoked_at` < ?',
+            [...ids, cutoff],
+        );
+        return result.affectedRows;
+    }
+
     /**
      * The live handle already minted over this exact region, if one exists —
      * what makes minting the same `(grantee, appUid, keyPrefix)` twice hand
      * back the one capability rather than a second row over the same
-     * permission.
+     * permission. One older than its app doesn't count, so sharing the region
+     * again makes a new one.
      */
     async findLive(
         input: FindLiveKvShareHandleInput,
@@ -301,12 +539,13 @@ export class KvShareHandleStore extends PuterStore {
             `SELECT ${SELECT_COLUMNS} FROM \`${TABLE}\` WHERE ` +
                 '`owner_user_id` = ? AND `grantee_user_id` = ? AND ' +
                 `\`app_uid\` = ? AND ${exactPrefix} AND \`revoked_at\` IS NULL ` +
-                'LIMIT 1',
+                `AND NOT ${this.#predatesAppSql()} LIMIT 1`,
             [
                 input.ownerUserId,
                 input.granteeUserId,
                 input.appUid,
                 input.keyPrefix,
+                APP_CLOCK_SKEW_SECONDS,
             ],
         );
         return rows.length > 0 ? toRow(rows[0]) : null;
@@ -339,7 +578,7 @@ export class KvShareHandleStore extends PuterStore {
     /**
      * Every live handle this owner holds out to one grantee, across every
      * region — what a revoke or an unshare walks to find the narrower handles
-     * that go with a wider one. Bounded by the per-account handle cap.
+     * that go with a wider one. Bounded by the per-holder handle cap.
      */
     async listLiveForOwnerAndGrantee(
         ownerUserId: number,
@@ -359,6 +598,8 @@ export class KvShareHandleStore extends PuterStore {
      * as absent, or a revoked one as live.
      */
     async getByHandle(handle: string): Promise<KvShareHandle | null> {
+        if (kvHandleIdKind(handle, this.config.jwt_secret_v2) === null)
+            return null;
         const rows = await this.clients.db.pread(
             `SELECT ${SELECT_COLUMNS} FROM \`${TABLE}\` WHERE \`handle\` = ?`,
             [handle],
@@ -425,33 +666,89 @@ export class KvShareHandleStore extends PuterStore {
                 `WHERE ${where.join(' AND ')}`,
             params,
         );
-        for (const handle of unique) this.#forget(handle);
+        this.#forgetEverywhere(unique);
     }
 
     /**
      * One batch of live handles in these apps' namespaces, oldest first. A
      * deleted app's handles are retired off this; the caller repeats until a
-     * batch comes back short.
+     * batch comes back short. `createdAtMost` (unix seconds) leaves out handles
+     * made later, which belong to an app registered since under the same uid.
      */
     async listLiveForApps(
         appUids: readonly string[],
         limit = KV_HANDLE_RETIRE_BATCH,
+        createdAtMost?: number,
     ): Promise<KvShareHandle[]> {
         const unique = [...new Set(appUids)];
         if (unique.length === 0) return [];
+        const created =
+            createdAtMost === undefined ? '' : 'AND `created_at` <= ? ';
         const rows = await this.clients.db.pread(
             `SELECT ${SELECT_COLUMNS} FROM \`${TABLE}\` ` +
                 `WHERE \`app_uid\` IN (${unique.map(() => '?').join(', ')}) ` +
-                'AND `revoked_at` IS NULL ORDER BY `id` LIMIT ?',
-            [...unique, limit],
+                `AND \`revoked_at\` IS NULL ${created}ORDER BY \`id\` LIMIT ?`,
+            [
+                ...unique,
+                ...(createdAtMost === undefined ? [] : [createdAtMost]),
+                limit,
+            ],
         );
         return rows.map(toRow);
     }
 
     /**
-     * Change a live handle's level or label in place, scoped to its owner. A
-     * compare-and-set on `revoked_at IS NULL`, so a handle retired meanwhile
-     * stays retired; returns the row as it now stands, or `null` for none.
+     * One batch of live handles one owner holds out in one app's namespace,
+     * oldest first, over the `(owner_user_id, app_uid, id)` index. The caller
+     * repeats until a batch comes back short. `createdAtMost` as in
+     * {@link listLiveForApps}.
+     */
+    async listLiveForOwnerApp(
+        ownerUserId: number,
+        appUid: string,
+        limit = KV_HANDLE_RETIRE_BATCH,
+        createdAtMost?: number,
+    ): Promise<KvShareHandle[]> {
+        const created =
+            createdAtMost === undefined ? '' : 'AND `created_at` <= ? ';
+        const rows = await this.clients.db.pread(
+            `SELECT ${SELECT_COLUMNS} FROM \`${TABLE}\` ` +
+                'WHERE `owner_user_id` = ? AND `app_uid` = ? ' +
+                `AND \`revoked_at\` IS NULL ${created}ORDER BY \`id\` LIMIT ?`,
+            [
+                ownerUserId,
+                appUid,
+                ...(createdAtMost === undefined ? [] : [createdAtMost]),
+                limit,
+            ],
+        );
+        return rows.map(toRow);
+    }
+
+    /**
+     * One batch of live handles one user holds, by id after `afterId`, over the
+     * grantee index. Deleting the holder's account retires off this before its
+     * rows cascade away.
+     */
+    async listLiveHeldBy(
+        granteeUserId: number,
+        afterId = 0,
+        limit = KV_HANDLE_RETIRE_BATCH,
+    ): Promise<Array<KvShareHandle & { id: number }>> {
+        const rows = await this.clients.db.pread(
+            `SELECT \`id\`, ${SELECT_COLUMNS} FROM \`${TABLE}\` ` +
+                'WHERE `grantee_user_id` = ? AND `id` > ? ' +
+                'AND `revoked_at` IS NULL ORDER BY `id` LIMIT ?',
+            [granteeUserId, afterId, limit],
+        );
+        return rows.map((row) => ({ ...toRow(row), id: Number(row.id) }));
+    }
+
+    /**
+     * Change a live handle's level, label or notify flag in place, scoped to
+     * its owner. A compare-and-set on `revoked_at IS NULL`, so a handle retired
+     * meanwhile stays retired; returns the row as it now stands, or `null` for
+     * none.
      */
     async update(
         handle: string,
@@ -471,6 +768,10 @@ export class KvShareHandleStore extends PuterStore {
             sets.push('`label` = ?');
             params.push(changes.label);
         }
+        if (changes.notify !== undefined) {
+            sets.push('`notify` = ?');
+            params.push(changes.notify ? 1 : 0);
+        }
         if (sets.length > 0) {
             await this.clients.db.write(
                 `UPDATE \`${TABLE}\` SET ${sets.join(', ')} ` +
@@ -479,7 +780,7 @@ export class KvShareHandleStore extends PuterStore {
                 [...params, handle, ownerUserId],
             );
         }
-        this.#forget(handle);
+        this.#forgetEverywhere([handle]);
         const row = await this.getByHandle(handle);
         return row && row.ownerUserId === ownerUserId ? row : null;
     }
@@ -487,7 +788,8 @@ export class KvShareHandleStore extends PuterStore {
     /**
      * Live handles held by one user, newest grants last, keyset-paginated on
      * the grantee index. Selected without the owner, prefix or grant string:
-     * this is the holder's listing, and none of those are theirs to see.
+     * this is the holder's listing, and none of those are theirs to see. One
+     * older than its app is left out.
      */
     async listLiveForGrantee(
         granteeUserId: number,
@@ -502,6 +804,8 @@ export class KvShareHandleStore extends PuterStore {
             filter.push('`app_uid` = ?');
             filterParams.push(options.appUid);
         }
+        filter.push(`NOT ${this.#predatesAppSql()}`);
+        filterParams.push(APP_CLOCK_SKEW_SECONDS);
         const where = [...filter];
         const params = [...filterParams];
         if (after !== null) {
@@ -510,8 +814,8 @@ export class KvShareHandleStore extends PuterStore {
         }
 
         const rows = await this.clients.db.read(
-            'SELECT `id`, `handle`, `app_uid`, `label`, `created_at`, ' +
-                `${ACCESS_COLUMN} FROM \`${TABLE}\` ` +
+            'SELECT `id`, `handle`, `app_uid`, `label`, `notify`, ' +
+                `\`created_at\`, ${ACCESS_COLUMN} FROM \`${TABLE}\` ` +
                 `WHERE ${where.join(' AND ')} ORDER BY \`id\` LIMIT ?`,
             [...params, limit + 1],
         );
@@ -525,6 +829,7 @@ export class KvShareHandleStore extends PuterStore {
                     row.label === null || row.label === undefined
                         ? null
                         : String(row.label),
+                notify: Number(row.notify) === 1,
                 createdAt: Number(row.created_at) || 0,
             })),
         };
@@ -547,7 +852,7 @@ export class KvShareHandleStore extends PuterStore {
      */
     async listForOwner(
         ownerUserId: number,
-        options: KvShareHandleListOptions = {},
+        options: KvShareOwnerListOptions = {},
     ): Promise<PageResult<KvShareHandle>> {
         const limit = clampLimit(options.limit);
         const after = openIdCursor(options.cursor, this.config.jwt_secret_v2);
@@ -558,6 +863,15 @@ export class KvShareHandleStore extends PuterStore {
             filter.push('`app_uid` = ?');
             filterParams.push(options.appUid);
         }
+        if (options.state === 'live') filter.push('`revoked_at` IS NULL');
+        if (options.state === 'revoked')
+            filter.push('`revoked_at` IS NOT NULL');
+        // A live one older than its app is left out until its retire lands
+        // and it lists as retired.
+        filter.push(
+            `(\`revoked_at\` IS NOT NULL OR NOT ${this.#predatesAppSql()})`,
+        );
+        filterParams.push(APP_CLOCK_SKEW_SECONDS);
 
         const where = [...filter];
         const params = [...filterParams];

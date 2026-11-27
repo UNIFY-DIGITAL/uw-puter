@@ -18,13 +18,16 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import type { EventMap } from '../../clients/event/types.js';
 import { handlerDepthOf, type Actor } from '../../core/actor.js';
 import { Context } from '../../core/context.js';
 import type { NotifEventContext } from '../events/registry.js';
 import { PuterService } from '../types.js';
 import {
     NotificationSocketAdapter,
+    notificationAckTimeoutMs,
     notificationsFoldInEnabled,
+    type ReceiptScope,
 } from './notificationSocket.js';
 import {
     findNotificationType,
@@ -129,7 +132,8 @@ export class NotificationService extends PuterService {
      * @param userIds Target user ids
      * @param notification Payload — { title, text?, icon?, fields? }
      * @param opts `{ type }` from the registry, `{ appUid }` for a row about an
-     *   app, `{ silent }` to skip the socket push.
+     *   app, `{ silent }` to skip the socket push, `{ group }` to make the row
+     *   findable by its group later.
      * @returns The uid of the first recipient's row, or `null` when nothing was
      *   written — there is no uid to hand back that would name anything.
      */
@@ -140,6 +144,7 @@ export class NotificationService extends PuterService {
             type: NotificationTypeName;
             appUid?: string | null;
             silent?: boolean;
+            group?: string | null;
         },
     ): Promise<string | null> {
         const appUid = opts.appUid ?? null;
@@ -158,6 +163,7 @@ export class NotificationService extends PuterService {
                         type: registered.type,
                         audience: registered.audience,
                         appUid,
+                        group: opts.group ?? null,
                     });
                 } catch (err) {
                     // One recipient's row failing is not the others' problem,
@@ -169,12 +175,27 @@ export class NotificationService extends PuterService {
                     return null;
                 }
 
-                if (!opts.silent)
+                if (!opts.silent) {
+                    // Listeners get their own copy; the socket sends `payload`.
+                    this.clients.event.emit(
+                        'notif.written',
+                        {
+                            userId,
+                            uid,
+                            type: registered.type,
+                            audience: registered.audience,
+                            appUid,
+                            value: structuredClone(payload),
+                            sendId: uuidv4(),
+                        },
+                        {},
+                    );
                     await this.#push(userId, uid, payload, {
                         type: registered.type,
                         audience: registered.audience,
                         appUid,
                     });
+                }
                 return uid;
             }),
         );
@@ -188,6 +209,10 @@ export class NotificationService extends PuterService {
      * notification would just be noise. Only a `groupable` type may be folded
      * this way; the scope columns are the original row's and don't move.
      *
+     * `replace` is a newer notification standing in for the old one: it takes
+     * only a row that was never shown, and records the replacement time, which
+     * live and fetched copies carry as their version.
+     *
      * False when there was nothing to rewrite (dismissed in between), which is
      * the caller's signal to send a fresh one.
      */
@@ -195,21 +220,29 @@ export class NotificationService extends PuterService {
         uid: string,
         userId: number,
         notification: Record<string, unknown>,
-        opts: { type: NotificationTypeName; silent?: boolean },
+        opts: {
+            type: NotificationTypeName;
+            silent?: boolean;
+            replace?: boolean;
+        },
     ): Promise<boolean> {
         const registered = findNotificationType(opts.type);
         if (!registered?.groupable) {
             throw new Error(`notification type is not groupable: ${opts.type}`);
         }
         const payload = { ...notification, type: registered.type };
+        const replacedAt = opts.replace ? Date.now() : undefined;
         const updated = await this.stores.notification.updateValue(
             uid,
             userId,
             payload,
+            replacedAt === undefined ? {} : { onlyUnseen: true, replacedAt },
         );
         if (!updated) return false;
+        if (opts.silent) return true;
 
-        if (!opts.silent) {
+        const desktop = inAccountMailbox(registered.type);
+        if (desktop) {
             // Same uid as the original: the client replaces what it is already
             // showing rather than stacking another copy. It goes straight to
             // the wire rather than through dispatch — the row was already
@@ -217,6 +250,39 @@ export class NotificationService extends PuterService {
             // to anything deduplicating on `event.id`.
             this.#socket().message(userId, uid, payload);
             this.#markDelivered(uid, userId);
+        }
+        const row = await this.stores.notification.getByUid(uid, { userId });
+        const app = notification.app as { uid?: unknown } | undefined;
+        const appUid =
+            row?.app_uid ?? (typeof app?.uid === 'string' ? app.uid : null);
+        this.clients.event.emit(
+            'notif.written',
+            {
+                userId,
+                uid,
+                type: registered.type,
+                audience: registered.audience,
+                appUid,
+                value: structuredClone(payload),
+                updated: true,
+                sendId: uuidv4(),
+            },
+            {},
+        );
+        // A type kept off the desktop has dispatch as its only live path, so
+        // the rewrite goes out there again, under the same uid.
+        if (!desktop) {
+            await this.#push(
+                userId,
+                uid,
+                payload,
+                {
+                    type: registered.type,
+                    audience: registered.audience,
+                    appUid,
+                },
+                replacedAt,
+            );
         }
         return true;
     }
@@ -240,6 +306,19 @@ export class NotificationService extends PuterService {
     }
 
     /**
+     * Delete one of the user's notifications and tell their other tabs, so it
+     * leaves every open list at once.
+     *
+     * @returns Whether a row was deleted; false for a uid naming none of the
+     *   user's rows, which also sends nothing.
+     */
+    async remove(uid: string, userId: number): Promise<boolean> {
+        const removed = await this.stores.notification.deleteByUid(uid, userId);
+        if (removed) this.#socket().removed(userId, uid);
+        return removed;
+    }
+
+    /**
      * Deliver one dispatched notification over the desktop's wire. The events
      * layer decides who is owed a delivery; this turns that decision into the
      * message the GUI has always listened for.
@@ -251,6 +330,18 @@ export class NotificationService extends PuterService {
             context.uid,
             context.notification,
         );
+    }
+
+    /**
+     * Ask the desktop's sockets, or with `appUid` the app's own, whether the
+     * live copy of a notification reached a page, and settle it as
+     * `notif.delivery.settled`. Costs a round trip to every node, so callers
+     * ask only when the answer changes what they do. Null when asking failed.
+     */
+    receipt(
+        scope: ReceiptScope,
+    ): Promise<EventMap['notif.delivery.settled'] | null> {
+        return this.#socket().receipt(scope);
     }
 
     /**
@@ -287,20 +378,39 @@ export class NotificationService extends PuterService {
             event: this.clients.event,
             socket: this.services.socket,
             foldIn: () => notificationsFoldInEnabled(this.config),
+            ackTimeoutMs: () => notificationAckTimeoutMs(this.config),
+            heldInPeerRegion: (userId, appUid) =>
+                this.#heldInPeerRegion(userId, appUid),
         });
         return this.#adapter;
+    }
+
+    /** A presence read that errors counts as no peer socket. */
+    async #heldInPeerRegion(
+        userId: number,
+        appUid: string | null,
+    ): Promise<boolean> {
+        const eventForward = this.services.eventForward;
+        if (!eventForward?.active) return false;
+        try {
+            return (await eventForward.regionsFor(userId, appUid)).length > 0;
+        } catch {
+            return false;
+        }
     }
 
     /**
      * Publish one persisted notification. With the fold-in on, the events layer
      * owns the delivery and feeds the socket adapter; without it, the adapter
-     * pushes straight to the wire.
+     * pushes straight to the wire. `replacedAt` marks a replacement and is its
+     * time.
      */
     async #push(
         userId: number,
         uid: string,
         payload: Record<string, unknown>,
         scope: { type: string; audience: string; appUid: string | null },
+        replacedAt?: number,
     ): Promise<void> {
         const desktop = inAccountMailbox(scope.type);
         if (!notificationsFoldInEnabled(this.config)) {
@@ -333,7 +443,10 @@ export class NotificationService extends PuterService {
                 audience: scope.audience,
                 appUid: scope.appUid,
                 value: payload,
-                createdAt: Date.now(),
+                createdAt: replacedAt ?? Date.now(),
+                ...(replacedAt !== undefined
+                    ? { replaced: true as const }
+                    : {}),
                 ...(handlerDepth > 0 ? { handlerDepth } : {}),
             },
             {},

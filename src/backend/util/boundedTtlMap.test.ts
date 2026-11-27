@@ -53,6 +53,18 @@ describe('BoundedTtlMap', () => {
         expect(map.size).toBe(0);
     });
 
+    it('drops expired entries when another is set', () => {
+        const map = new BoundedTtlMap<string, number>({
+            maxEntries: 10,
+            ttlMs: 1000,
+        });
+        map.set('a', 1).set('b', 2);
+        vi.advanceTimersByTime(1000);
+        map.set('c', 3);
+        expect(map.size).toBe(1);
+        expect(map.get('c')).toBe(3);
+    });
+
     it('keeps entries without a TTL until evicted', () => {
         const map = new BoundedTtlMap<string, number>({ maxEntries: 10 });
         map.set('a', 1);
@@ -128,6 +140,19 @@ describe('BoundedTtlMap', () => {
             expect(map.shouldEmit('k')).toBe(true);
             map.delete('k');
             expect(map.shouldEmit('k')).toBe(true);
+        });
+    });
+
+    describe('deleteWhere', () => {
+        it('deletes only the matching entries and reports how many', () => {
+            const map = new BoundedTtlMap<string, number>({ maxEntries: 10 });
+            map.set('a', 1).set('b', 2).set('c', 3);
+
+            expect(map.deleteWhere((value) => value % 2 === 1)).toBe(2);
+            expect(map.has('a')).toBe(false);
+            expect(map.get('b')).toBe(2);
+            expect(map.has('c')).toBe(false);
+            expect(map.size).toBe(1);
         });
     });
 });

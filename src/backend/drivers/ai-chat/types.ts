@@ -175,6 +175,11 @@ export interface UsageDetails {
 export interface ICompleteArguments {
     messages: PuterMessage[];
     provider?: string;
+    /**
+     * `false` makes the first route's failure final instead of retrying the
+     * request on another provider that serves the same model.
+     */
+    fallback?: boolean;
     stream?: boolean;
     model: string;
     test_mode?: boolean;
@@ -238,7 +243,7 @@ export interface ICompleteArguments {
         'auto' | 'default' | 'flex' | 'scale' | 'priority' | undefined;
     max_tokens?: number;
     temperature?: number;
-    reasoning?: { effort: 'low' | 'medium' | 'high' } | undefined;
+    reasoning?: { effort: ReasoningEffort } | undefined;
     text?: { verbosity?: 'low' | 'medium' | 'high' | undefined } | undefined;
     reasoning_effort?: ReasoningEffort | undefined;
     verbosity?: 'low' | 'medium' | 'high' | undefined;
@@ -345,6 +350,8 @@ export interface IChatProvider {
         inputKey?: string;
         outputKey?: string;
         extraCost?: number;
+        /** Provider-specific prompt tokens outside message.content. */
+        additionalPromptTokens?: number;
         maxTokens?: number;
     };
     /**

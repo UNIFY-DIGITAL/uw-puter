@@ -1658,6 +1658,19 @@ input.myapps-group-name:focus {
     font-size: 14px;
     color: var(--dashboard-text-secondary);
 }
+.myapps-modal-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 16px;
+    font-size: 14px;
+    color: var(--dashboard-text-primary);
+    cursor: pointer;
+}
+.myapps-modal-option input {
+    margin: 0;
+    cursor: pointer;
+}
 .myapps-modal-buttons {
     display: flex;
     justify-content: flex-end;
@@ -1993,6 +2006,146 @@ input.myapps-group-name:focus {
     }
 }
 
+/* Custom domain modal (puter.hosting.attach), on the app feedback shell. */
+.custom-domain-modal {
+    width: min(520px, 100%);
+}
+.custom-domain-intro,
+.custom-domain-requester {
+    margin: 0 0 12px;
+    font-size: 14px;
+    line-height: 1.45;
+    word-break: break-word;
+}
+.custom-domain-requester {
+    margin-top: -6px;
+    font-size: 12px;
+    color: var(--afb-muted);
+}
+.custom-domain-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border: 1px solid var(--afb-border);
+    border-radius: 10px;
+    overflow: hidden;
+}
+.custom-domain-list:empty {
+    display: none;
+}
+.custom-domain-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+}
+.custom-domain-row + .custom-domain-row {
+    border-top: 1px solid var(--afb-border);
+}
+.custom-domain-row-main {
+    flex: 1;
+    min-width: 0;
+}
+.custom-domain-row-host {
+    font-size: 14px;
+    font-weight: 600;
+    word-break: break-all;
+}
+.custom-domain-row-meta {
+    font-size: 12px;
+    color: var(--afb-muted);
+    margin-top: 2px;
+}
+.custom-domain-confirming .custom-domain-row-meta {
+    color: var(--afb-fg);
+}
+.custom-domain-row .app-feedback-btn {
+    flex: none;
+    padding: 6px 14px;
+}
+.custom-domain-empty {
+    margin: 4px 0 0;
+    font-size: 14px;
+    color: var(--afb-muted);
+}
+.custom-domain-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 6px;
+}
+.custom-domain-input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 12px;
+    font: inherit;
+    font-size: 14px;
+    color: var(--afb-fg);
+    background: var(--afb-field-bg);
+    border: 1px solid var(--afb-field-border);
+    border-radius: 8px;
+}
+.custom-domain-input:focus {
+    outline: none;
+    border-color: #088ef0;
+    box-shadow: 0 0 0 3px rgba(8, 142, 240, 0.18);
+}
+.custom-domain-status {
+    margin: 0 0 8px;
+    font-size: 14px;
+    line-height: 1.45;
+    word-break: break-word;
+}
+.custom-domain-status-detail {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--afb-muted);
+}
+.custom-domain-records {
+    width: 100%;
+    margin-top: 10px;
+    border-collapse: collapse;
+    font-size: 12px;
+    table-layout: fixed;
+}
+.custom-domain-records th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--afb-muted);
+    padding: 0 6px 6px 0;
+}
+.custom-domain-records th:first-child {
+    width: 86px;
+}
+.custom-domain-records td {
+    padding: 6px 6px 6px 0;
+    border-top: 1px solid var(--afb-border);
+    vertical-align: top;
+}
+.custom-domain-redirect strong {
+    color: var(--afb-fg);
+    word-break: break-all;
+}
+.custom-domain-use-www {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
+    font-size: 13px;
+}
+.custom-domain-copy {
+    display: block;
+    word-break: break-all;
+    cursor: copy;
+    border-radius: 4px;
+}
+@media (hover: hover) {
+    .custom-domain-copy:hover {
+        background: var(--afb-hover);
+    }
+}
+
 /* Add-an-app chooser (see showAddAppModal): the three ways to get an app, as
    rows in the same modal shell. min-width gives the two-line rows room without
    overflowing a narrow phone; the shell's own max-width caps the other end. */
@@ -2216,9 +2369,12 @@ p.myapps-add-error {
     opacity: 0;
     transition: opacity 200ms ease;
     z-index: 1000;
+    /* Fading out after a close, it must not take the next click. */
+    pointer-events: none;
 }
 .item-props-overlay.item-props-show {
     opacity: 1;
+    pointer-events: auto;
 }
 
 .item-props-modal {
@@ -2543,9 +2699,12 @@ p.myapps-add-error {
     opacity: 0;
     transition: opacity 200ms ease;
     z-index: 1000;
+    /* Fading out after a close, it must not take the next click. */
+    pointer-events: none;
 }
 .share-modal-overlay.share-modal-show {
     opacity: 1;
+    pointer-events: auto;
 }
 
 .share-modal {
@@ -2751,6 +2910,35 @@ button.share-modal-title-sub:focus-visible {
     padding: 16px 18px 18px;
 }
 
+/* Footer: the status line, then Copy link and Done. Outside the scrolling
+   body, so a message is in view wherever the list is scrolled to. */
+.share-modal-footer {
+    flex-shrink: 0;
+    padding: 12px 18px 14px;
+    border-top: 1px solid var(--dashboard-border);
+}
+.share-modal-footer-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.share-modal-done {
+    margin-left: auto;
+}
+.share-modal-copy-link {
+    gap: 6px;
+}
+.share-modal-copy-link[hidden] {
+    display: none;
+}
+.share-modal-copy-icon {
+    display: flex;
+}
+.share-modal-copy-link.share-modal-copied {
+    border-color: var(--dashboard-success-border);
+    color: var(--dashboard-success-text);
+}
+
 /* Add people. style.css's input[type=text] / select rules match these
    controls at the SAME specificity, so everything must be spelled out here
    (twice for focus — input[type=text]:focus sets padding 7px / border 2px).
@@ -2759,12 +2947,25 @@ button.share-modal-title-sub:focus-visible {
     display: flex;
     gap: 8px;
 }
+.share-modal-add-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+    animation: share-modal-reveal 150ms ease-out;
+}
+.share-modal-add-actions[hidden] {
+    display: none;
+}
+@keyframes share-modal-reveal {
+    from { opacity: 0; transform: translateX(6px); }
+}
 input.share-modal-recipient {
     -webkit-appearance: none;
     appearance: none;
     box-sizing: border-box;
     flex: 1 1 auto;
     width: auto;
+    height: 36px;
     min-width: 0;
     /* On narrow screens the placeholder outgrows the field; fade it out
        with an ellipsis instead of clipping mid-letter. */
@@ -2815,6 +3016,9 @@ select.share-modal-mode,
 select.share-modal-link-mode {
     flex-shrink: 0;
 }
+select.share-modal-mode {
+    height: 36px;
+}
 select.share-modal-mode:focus,
 select.share-modal-link-access:focus,
 select.share-modal-link-mode:focus,
@@ -2856,56 +3060,75 @@ select.share-modal-row-mode:disabled {
 }
 
 /* General access: the owner's switch between people-only and anyone with
-   the link, below the people and team controls. The copy button is the team
-   button's quieter sibling. */
+   the link, as one row shaped like a person's — an icon where the avatar
+   goes, the switch and what it means, and the level on the right. */
 .share-modal-general {
-    margin-top: 18px;
-    padding-top: 16px;
-    border-top: 1px solid var(--dashboard-border);
+    margin-top: 20px;
 }
 
 .share-modal-general .share-modal-heading {
-    margin: 0 0 8px;
+    margin: 0 0 6px;
 }
 
 .share-modal-general-row {
     display: flex;
-    gap: 8px;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 0;
 }
 
-select.share-modal-link-access {
+.share-modal-general-icon {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--dashboard-hover);
+    color: var(--dashboard-text-secondary);
+    transition: background 0.15s, color 0.15s;
+}
+
+.share-modal-general-icon.share-modal-general-icon-open {
+    background: var(--dashboard-success-background);
+    color: var(--dashboard-success-text);
+}
+
+.share-modal-general-text {
     flex: 1 1 auto;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+/* Reads as the row's title; the padding lets the hover fill reach past the
+   text while the text itself lines up with the note below. */
+select.share-modal-link-access {
+    max-width: calc(100% + 8px);
+    margin-left: -8px;
+    padding: 3px 24px 3px 8px;
+    border-color: transparent;
+    background-color: transparent;
+    background-position: right 6px center;
+    font-size: 13.5px;
+    font-weight: 600;
+    field-sizing: content;
+}
+select.share-modal-link-access:focus {
+    padding: 3px 24px 3px 8px;
+}
+@media (hover: hover) {
+    select.share-modal-link-access:hover:not(:disabled) {
+        background-color: var(--dashboard-hover);
+    }
 }
 
 .share-modal-general-note {
-    margin: 8px 0 0;
-    font-size: 12.5px;
-    line-height: 1.45;
-    color: var(--dashboard-text-hint);
-}
-
-.share-modal-copy-link {
-    width: 100%;
-    height: 38px;
-    margin-top: 10px;
-    padding: 0 16px;
-    border: 1px solid var(--dashboard-border);
-    border-radius: 10px;
-    background: transparent;
-    font-size: 13.5px;
-    font-weight: 600;
-    font-family: inherit;
-    color: var(--dashboard-text-primary);
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
-}
-
-@media (hover: hover) {
-    .share-modal-copy-link:hover:not(:disabled) {
-        background: var(--dashboard-card-background);
-        border-color: var(--dashboard-text-hint);
-    }
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--dashboard-text-muted);
 }
 
 .share-modal-submit {
@@ -2913,14 +3136,14 @@ select.share-modal-link-access {
     align-items: center;
     justify-content: center;
     gap: 8px;
-    width: 100%;
-    margin-top: 10px;
+    flex-shrink: 0;
+    box-sizing: border-box;
     padding: 0 16px;
-    height: 38px;
+    height: 36px;
     border: 1px solid var(--dashboard-button-primary);
-    border-radius: 10px;
+    border-radius: 8px;
     background: var(--dashboard-button-primary);
-    font-size: 13.5px;
+    font-size: 13px;
     font-weight: 600;
     font-family: inherit;
     color: #fff;
@@ -2983,16 +3206,16 @@ select.share-modal-link-access {
    display:none — a live region revealed in the same frame as its text is
    unreliably announced, so it stays in the a11y tree between messages. */
 .share-modal-status {
-    margin-top: 12px;
-    padding: 9px 12px;
+    margin-bottom: 10px;
+    padding: 8px 12px;
     border: 1px solid transparent;
     border-radius: 8px;
-    font-size: 13px;
+    font-size: 12.5px;
     line-height: 1.45;
     word-break: break-word;
 }
 .share-modal-status:empty {
-    margin-top: 0;
+    margin-bottom: 0;
     padding: 0;
     border-width: 0;
 }
@@ -3009,28 +3232,27 @@ select.share-modal-link-access {
 
 /* Access list */
 .share-modal-heading {
-    margin: 18px 0 2px;
     font-size: 13px;
     font-weight: 600;
     color: var(--dashboard-text-secondary);
+}
+.share-modal-list {
+    margin-top: 10px;
 }
 .share-modal-row {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 9px 0;
-    border-bottom: 1px solid var(--dashboard-border);
-}
-.share-modal-row:last-child {
-    border-bottom: none;
+    min-height: 32px;
+    padding: 5px 0;
 }
 .share-modal-avatar {
     flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
     border-radius: 50%;
     font-size: 13px;
     font-weight: 600;
@@ -3097,49 +3319,40 @@ select.share-modal-link-access {
     font-size: 12.5px;
     color: var(--dashboard-text-secondary);
 }
+select.share-modal-link-mode,
 select.share-modal-row-mode {
     flex-shrink: 0;
+    max-width: 50%;
     padding: 5px 24px 5px 8px;
     border-color: transparent;
     background-color: transparent;
     font-size: 12.5px;
     color: var(--dashboard-text-secondary);
     background-position: right 6px center;
+    /* Sized to the level on show rather than the longest entry ("Remove
+       access"), so the chevron sits next to the text. Where unsupported,
+       the text at least hugs the chevron. */
+    field-sizing: content;
+    text-align-last: right;
+}
+select.share-modal-row-mode option,
+select.share-modal-link-mode option {
+    text-align: left;
+}
+select.share-modal-row-mode option.share-modal-option-danger {
+    color: var(--dashboard-danger-text);
 }
 @media (hover: hover) {
+    select.share-modal-link-mode:hover:not(:disabled),
     select.share-modal-row-mode:hover:not(:disabled) {
         background-color: var(--dashboard-hover);
         color: var(--dashboard-text-primary);
     }
 }
+select.share-modal-link-mode:focus,
 select.share-modal-row-mode:focus {
     padding: 5px 24px 5px 8px;
     border: 1px solid var(--select-color);
-}
-.share-modal-revoke {
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 30px;
-    height: 30px;
-    padding: 0;
-    border: none;
-    border-radius: 8px;
-    background: transparent;
-    color: var(--dashboard-text-secondary);
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-}
-@media (hover: hover) {
-    .share-modal-revoke:hover:not(:disabled) {
-        background: var(--dashboard-danger-background);
-        color: var(--dashboard-danger-text);
-    }
-}
-.share-modal-revoke:focus-visible {
-    outline: none;
-    box-shadow: 0 0 0 3px var(--select-ring);
 }
 .share-modal-empty {
     margin: 0;
@@ -3207,20 +3420,17 @@ select.share-modal-row-mode:focus {
     cursor: default;
 }
 
-/* Touch: every control clears 44px. The icon buttons keep their 30-32px
-   visuals but hit-test at 44x44 via a centered pseudo-element (the 10px
-   gap to the row's select and the 18px between rows absorb the overhang
-   without overlap); everything else grows for real via min-height, which
-   holds whatever the inherited line-height turns out to be.
+/* Touch: every control clears 44px. The close button keeps its 32px
+   visual but hit-tests at 44x44 via a centered pseudo-element; everything
+   else grows for real via min-height, which holds whatever the inherited
+   line-height turns out to be.
    This block sits below every base rule it overrides — a media query
    adds no specificity, so source order decides. */
 @media (pointer: coarse) {
-    .share-modal-close,
-    .share-modal-revoke {
+    .share-modal-close {
         position: relative;
     }
-    .share-modal-close::before,
-    .share-modal-revoke::before {
+    .share-modal-close::before {
         content: '';
         position: absolute;
         left: 50%;
@@ -3250,19 +3460,18 @@ select.share-modal-row-mode:focus {
     select.share-modal-mode,
     select.share-modal-mode:focus,
     select.share-modal-link-access,
-    select.share-modal-link-access:focus,
-    select.share-modal-link-mode,
-    select.share-modal-link-mode:focus {
+    select.share-modal-link-access:focus {
         min-height: 44px;
     }
+    select.share-modal-link-mode,
+    select.share-modal-link-mode:focus,
     select.share-modal-row-mode,
     select.share-modal-row-mode:focus {
         min-height: 44px;
         padding-top: 9px;
         padding-bottom: 9px;
     }
-    .share-modal-submit,
-    .share-modal-copy-link {
+    .share-modal-submit {
         height: 44px;
     }
     .share-modal-btn-quiet,
@@ -3313,9 +3522,14 @@ select.share-modal-row-mode:focus {
         transform: translateY(0);
     }
     /* The sheet sits flush with the physical bottom edge (viewport-fit=
-       cover), so the scrollable body clears the home indicator itself. */
-    .share-modal-body {
-        padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+       cover), so the footer clears the home indicator itself. */
+    .share-modal-footer {
+        padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    }
+    /* Copy link and Done split the row rather than stacking. */
+    .share-modal-footer-row .dashboard-dialog-btn {
+        flex: 1 1 0;
+        min-width: 0;
     }
 }
 
@@ -3323,6 +3537,9 @@ select.share-modal-row-mode:focus {
     .share-modal-overlay,
     .share-modal {
         transition: none;
+    }
+    .share-modal-add-actions {
+        animation: none;
     }
     .share-modal-spinner {
         animation-duration: 1.6s;
@@ -4250,6 +4467,11 @@ body.myapps-reordering .myapps-tile {
     outline-offset: -2px;
 }
 
+/* Holds the focus while the keys move the selection, which marks the place. */
+.dashboard-section-files .files-tab .files:focus {
+    outline: none;
+}
+
 .dashboard-section-files .header .path-btn-disabled {
     opacity: 0.1;
     pointer-events: none;
@@ -4922,6 +5144,25 @@ body.myapps-reordering .myapps-tile {
     color: var(--dashboard-text-tertiary);
 }
 
+/* On a touch screen the '⋯' is a 20x23 target beside a row whose tap opens
+   the item, so a near miss opened the item instead of the menu. It takes the
+   row's height and a finger's width. (Two-row rows get a 44px square below.) */
+@media (pointer: coarse) {
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-more {
+        position: relative;
+    }
+
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-more::before {
+        content: '';
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 44px;
+        height: 32px;
+        transform: translate(-50%, -50%);
+    }
+}
+
 .dashboard-section-files .files-tab .files.files-list-view .row.selected .item-size,
 .dashboard-section-files .files-tab .files.files-list-view .row.selected .item-modified {
     color: inherit;
@@ -5137,6 +5378,13 @@ body.myapps-reordering .myapps-tile {
     filter: none;
 }
 
+@media (prefers-color-scheme: dark) {
+    /* A black glyph, lost on the dark row: drawn light instead. */
+    .dashboard-section-files .files-tab .files.files-list-view .row img.item-has-website-url-badge {
+        filter: invert(1);
+    }
+}
+
 /* Badges live top-LEFT in grid view; the top-right corner belongs to the
    hover '⋯' button (.item-more) and they must not overlap. */
 .dashboard-section-files .files-tab .files.files-grid-view .row .item-badges {
@@ -5270,6 +5518,9 @@ body.myapps-reordering .myapps-tile {
 .dashboard-section-files .files-tab .files.files-grid-view .row .item-name-wrapper {
     width: 100%;
     display: block;
+    /* Above the tile-sized badge layer, which would take the hover that
+       shows a shortened name in full. */
+    position: relative;
 }
 
 @media (hover: hover) {
@@ -5769,6 +6020,10 @@ body.myapps-reordering .myapps-tile {
     position: fixed;
     /* On body, above the dashboard window (see the sidebar tooltip). */
     z-index: 999999999;
+    /* Sized to the image, within the bounds showImagePreview sets */
+    box-sizing: border-box;
+    width: max-content;
+    min-width: 160px;
     background: var(--dashboard-background);
     border: 1px solid var(--dashboard-border);
     border-radius: 8px;
@@ -5783,11 +6038,14 @@ body.myapps-reordering .myapps-tile {
 .image-preview-popover img {
     max-width: 100%;
     max-height: 70vh;
+    /* Shrinks to leave the name room in a short listing */
+    min-height: 0;
     object-fit: contain;
     border-radius: 4px;
 }
 
 .image-preview-name {
+    flex-shrink: 0;
     font-size: 14px;
     color: var(--dashboard-text);
     text-align: center;
@@ -6013,9 +6271,20 @@ body.myapps-reordering .myapps-tile {
         margin-bottom: 12px;
     }
 
-    /* Clear the fixed menu button beside the crumbs */
+    /* Clear the fixed menu button beside the crumbs, and match its height:
+       a shorter row put the arrows below under the button's tap area, so
+       the top of Back opened the menu. */
     .dashboard-section-files .header .path-breadcrumbs {
         margin-left: 50px;
+        box-sizing: content-box;
+        min-height: 40px;
+    }
+
+    /* Finger-sized crumbs, in that row */
+    @media (pointer: coarse) {
+        .dashboard-section-files .header .path .dirname {
+            padding: 8px 6px;
+        }
     }
 
     /* Adjust footer position - full width since sidebar is hidden. It sits
@@ -6029,6 +6298,13 @@ body.myapps-reordering .myapps-tile {
 
     .dashboard-section-files .files {
         padding-bottom: calc(30px + env(safe-area-inset-bottom, 0px));
+    }
+
+    /* The grids keep their own padding and clear the footer with a margin,
+       which has to grow with the footer as well. (Select mode makes room
+       for its bar, safe area included, below.) */
+    .dashboard-section-files .files-tab:not(.select-mode-active) .files.files-grid-view {
+        margin-bottom: calc(30px + env(safe-area-inset-bottom, 0px));
     }
 
     /* Mobile: Floating selection actions - icon-only, full width */
@@ -7273,6 +7549,43 @@ body.myapps-reordering .myapps-tile {
     transform: translateX(10px);
 }
 
+/* A titled group of settings cards */
+.dashboard-settings-group-title {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--dashboard-text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.dashboard-settings-card-info .dashboard-settings-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 500;
+    vertical-align: 1px;
+    color: var(--dashboard-success-text);
+    background: var(--dashboard-success-background);
+    border: 1px solid var(--dashboard-success-border);
+}
+
+.dashboard-settings-empty {
+    margin: 0;
+    padding: 4px 0;
+    font-size: 14px;
+    color: var(--dashboard-text-hint);
+}
+
+.dashboard-settings-card-icon img {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    object-fit: contain;
+}
+
 /* Danger zone */
 .dashboard-danger-zone {
     padding-top: 24px;
@@ -7609,6 +7922,19 @@ body.myapps-reordering .myapps-tile {
     .context-menu-modal-backdrop {
         background-color: transparent;
     }
+}
+
+/* "No files in this directory." and "couldn't be opened", in place of rows */
+.files-notice {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 0 16px;
+    text-align: center;
+    color: var(--dashboard-text-tertiary);
+    pointer-events: none;
 }
 
 /* ======================================
@@ -8445,6 +8771,13 @@ body.dashboard-mode .window-dashboard-headless .window-body-app {
     height: 18px;
 }
 
+.dashboard-notification-icon img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+}
+
 .dashboard-notification-icon-sharing {
     background: var(--dashboard-bento-apps-surface);
     color: var(--dashboard-bento-apps-icon-bg);
@@ -8461,8 +8794,18 @@ body.dashboard-mode .window-dashboard-headless .window-body-app {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    /* Room for the ✕ that appears on hover, so text never sits under it */
+    /* Room for the controls that appear on hover, so text never sits under them */
     padding-right: 22px;
+}
+
+.dashboard-notification.is-unread .dashboard-notification-content {
+    padding-right: 50px;
+}
+
+.dashboard-notification-sender {
+    font-size: 12px;
+    color: var(--dashboard-text-secondary);
+    overflow-wrap: anywhere;
 }
 
 .dashboard-notification-title {
@@ -8505,10 +8848,16 @@ body.dashboard-mode .window-dashboard-headless .window-body-app {
     margin-top: 2px;
 }
 
-.dashboard-notification-read {
+.dashboard-notification-actions {
     position: absolute;
     top: 8px;
     right: 8px;
+    display: flex;
+    gap: 2px;
+}
+
+.dashboard-notification-read,
+.dashboard-notification-remove {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -8524,32 +8873,36 @@ body.dashboard-mode .window-dashboard-headless .window-body-app {
     transition: opacity 0.12s, background-color 0.15s, color 0.15s;
 }
 
-.dashboard-notification-read svg {
+.dashboard-notification-read svg,
+.dashboard-notification-remove svg {
     width: 14px;
     height: 14px;
 }
 
-.dashboard-notification:hover .dashboard-notification-read,
-.dashboard-notification:focus-within .dashboard-notification-read {
+.dashboard-notification:hover :is(.dashboard-notification-read, .dashboard-notification-remove),
+.dashboard-notification:focus-within :is(.dashboard-notification-read, .dashboard-notification-remove) {
     opacity: 1;
 }
 
 @media (hover: hover) {
-    .dashboard-notification-read:hover {
+    .dashboard-notification-read:hover,
+    .dashboard-notification-remove:hover {
         background: var(--dashboard-border);
         color: var(--dashboard-text);
     }
 }
 
-/* Touch has no hover to reveal it */
+/* Touch has no hover to reveal them */
 @media (hover: none) {
-    .dashboard-notification-read {
+    .dashboard-notification-read,
+    .dashboard-notification-remove {
         opacity: 1;
     }
 }
 
 .dashboard-notification-main:focus-visible,
 .dashboard-notification-read:focus-visible,
+.dashboard-notification-remove:focus-visible,
 .dashboard-notifications-mark-all:focus-visible,
 .dashboard-notifications-close:focus-visible,
 .dashboard-notifications-retry:focus-visible {
@@ -8829,6 +9182,7 @@ body.dashboard-mode .notifications-close-all {
     .dashboard-notifications-scrim,
     .dashboard-notification,
     .dashboard-notification-read,
+    .dashboard-notification-remove,
     .dashboard-notification-icon,
     .dashboard-notification-title,
     .dashboard-notification-text {
@@ -8864,10 +9218,13 @@ body.dashboard-mode .notifications-close-all {
     opacity: 0;
     transition: opacity 200ms ease;
     z-index: 1000;
+    /* Fading out after a close, it must not take the next click. */
+    pointer-events: none;
 }
 
 .dashboard-dialog-overlay.dashboard-dialog-show {
     opacity: 1;
+    pointer-events: auto;
 }
 
 .dashboard-dialog {
@@ -9279,6 +9636,95 @@ body.dashboard-mode .notifications-close-all {
     }
 }
 
+/* A text field with fixed text after it (a domain), drawn as one box. */
+.dashboard-form-affix {
+    display: flex;
+    align-items: center;
+    height: 38px;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 10px;
+    background: var(--dashboard-input-background);
+    box-sizing: border-box;
+    overflow: hidden;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.dashboard-form-affix:focus-within {
+    border-color: var(--select-color);
+    background: var(--dashboard-card-background);
+    box-shadow: 0 0 0 3px var(--select-ring);
+}
+
+.dashboard-form-affix:has([aria-invalid='true']) {
+    border-color: var(--dashboard-danger-text);
+}
+
+.dashboard-dialog .dashboard-form-affix .dashboard-dialog-input,
+.dashboard-dialog .dashboard-form-affix .dashboard-dialog-input:focus {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 100%;
+    padding: 0 2px 0 12px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    text-align: right;
+}
+
+/* Locked while the form submits: dim the whole box, suffix included, as
+   one field rather than the input alone. */
+.dashboard-form-affix:has(:disabled) {
+    opacity: 0.6;
+}
+
+.dashboard-dialog .dashboard-form-affix .dashboard-dialog-input:disabled {
+    opacity: 1;
+}
+
+.dashboard-form-suffix {
+    flex-shrink: 0;
+    max-width: 60%;
+    padding-right: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+    color: var(--dashboard-text-muted);
+    cursor: text;
+}
+
+@media (pointer: coarse) {
+    .dashboard-form-affix {
+        height: 44px;
+    }
+
+    .dashboard-form-suffix {
+        font-size: 16px;
+    }
+}
+
+/* A switch sits beside its label and hint, as on the settings cards. */
+.dashboard-form-switch-field {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.dashboard-form-switch-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.dashboard-form-switch-field .dashboard-form-label {
+    font-size: 13px;
+    color: var(--dashboard-text-primary);
+    cursor: pointer;
+}
+
 /* Password fields carry a show/hide toggle inside the box. */
 .dashboard-form-secret {
     position: relative;
@@ -9338,6 +9784,7 @@ body.dashboard-mode .notifications-close-all {
    the content column's gap it would otherwise still claim. */
 .dashboard-form-status {
     padding: 9px 12px;
+    white-space: pre-line;
     border: 1px solid transparent;
     border-radius: 8px;
     font-size: 13px;
@@ -9425,12 +9872,13 @@ body.dashboard-mode .notifications-close-all {
     line-height: 1.45;
 }
 
-.dashboard-token-row {
+/* A value to copy: the API token, a published address. */
+.dashboard-copy-row {
     display: flex;
     gap: 8px;
 }
 
-.dashboard-dialog .dashboard-dialog-input.dashboard-token-value {
+.dashboard-dialog .dashboard-dialog-input.dashboard-copy-value {
     flex: 1 1 auto;
     min-width: 0;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -9439,13 +9887,35 @@ body.dashboard-mode .notifications-close-all {
 
 /* 16px, like the other dialog inputs on touch, so iOS doesn't zoom on focus. */
 @media (pointer: coarse) {
-    .dashboard-dialog .dashboard-dialog-input.dashboard-token-value {
+    .dashboard-dialog .dashboard-dialog-input.dashboard-copy-value {
         font-size: 16px;
     }
 }
 
-.dashboard-token-copy {
+.dashboard-copy-row .dashboard-dialog-btn {
     flex-shrink: 0;
+}
+
+/* A square button holding only an icon, as in a compact copy row. */
+.dashboard-dialog-btn.dashboard-icon-btn {
+    min-width: 36px;
+    width: 36px;
+    padding: 0;
+    color: var(--dashboard-text-secondary);
+    text-decoration: none;
+}
+
+.dashboard-icon-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
+@media (pointer: coarse) {
+    .dashboard-dialog-btn.dashboard-icon-btn {
+        min-width: 44px;
+        width: 44px;
+        padding: 0;
+    }
 }
 
 .dashboard-token-sessions {
@@ -9471,7 +9941,7 @@ body.dashboard-mode .notifications-close-all {
 }
 
 @media (max-width: 600px) {
-    .dashboard-token-row {
+    .dashboard-copy-row:not(.dashboard-copy-row-compact) {
         flex-direction: column;
     }
 }
