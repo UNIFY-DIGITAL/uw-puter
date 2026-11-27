@@ -262,8 +262,13 @@ export class SuggestedAppsService extends PuterService {
 
         // Built-in apps, looked up by their stable app name. Parallel-safe
         // because order is imposed below via `builtinNames`.
+        // Built-in apps this server hides (config hidden_builtin_apps,
+        // e.g. ones that load from outside sites) are never offered.
+        const hidden = new Set<string>(this.config.hidden_builtin_apps ?? []);
         const builtinApps = await Promise.all(
-            builtinNames.map((appName) => this.stores.app.getByName(appName)),
+            builtinNames
+                .filter((appName) => !hidden.has(appName))
+                .map((appName) => this.stores.app.getByName(appName)),
         );
 
         const thirdPartyApps = ext
@@ -278,9 +283,13 @@ export class SuggestedAppsService extends PuterService {
         // only a guess — an app that explicitly registered the extension
         // outranks it (a .docx should open in a word processor that claimed
         // it, not in the plain-text editor).
-        const ordered = isFallback
-            ? [...thirdPartyApps, ...builtinApps]
-            : [...builtinApps, ...thirdPartyApps];
+        // An app marked as the preferred opener (metadata.preferred_opener) leads.
+        const ordered = [
+            ...thirdPartyApps.filter(isPreferredOpener),
+            ...(isFallback
+                ? [...thirdPartyApps, ...builtinApps]
+                : [...builtinApps, ...thirdPartyApps]),
+        ];
 
         const seen = new Set<number>();
         const candidates: Array<Record<string, unknown>> = [];
@@ -322,5 +331,26 @@ export class SuggestedAppsService extends PuterService {
             .map((app) =>
                 toAppSummary(app, { apiBaseUrl, config: this.config }),
             );
+    }
+}
+
+/**
+ * An app the server's operator marked as the preferred opener of the file types
+ * it registered (metadata.preferred_opener: true).
+ */
+function isPreferredOpener(
+    app: { metadata?: unknown } | null | undefined,
+): boolean {
+    try {
+        const meta =
+            typeof app?.metadata === 'string'
+                ? JSON.parse(app.metadata)
+                : app?.metadata;
+        return (
+            (meta as { preferred_opener?: unknown } | undefined)
+                ?.preferred_opener === true
+        );
+    } catch {
+        return false;
     }
 }
