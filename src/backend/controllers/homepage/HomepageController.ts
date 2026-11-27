@@ -43,9 +43,9 @@ const APP_LANDING_LIMIT = {
 };
 
 /**
- * App descriptions can run long; search snippets and social cards want a
- * short blurb. Collapses whitespace, then cuts at a word boundary with an
- * ellipsis so the result never exceeds `APP_META_DESCRIPTION_MAX`.
+ * App descriptions can run long; search snippets and social cards want a short
+ * blurb. Collapses whitespace, then cuts at a word boundary with an ellipsis so
+ * the result never exceeds `APP_META_DESCRIPTION_MAX`.
  */
 export function appMetaDescription(text: string): string {
     const clean = text.replace(/\s+/g, ' ').trim();
@@ -78,7 +78,11 @@ export class HomepageController extends PuterController {
             short_description: String(
                 this.config.gui_params?.short_description ?? '',
             ),
-            company: 'Puter Technologies Inc.',
+            company: String(
+                this.config.gui_params?.company ||
+                    this.config.gui_params?.brand_name ||
+                    'Puter Technologies Inc.',
+            ),
             canonical_url: `${req.protocol}://${this.config.domain ?? req.hostname}${req.path}`,
             social_media_image: String(
                 this.config.gui_params?.social_media_image ?? '',

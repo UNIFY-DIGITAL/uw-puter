@@ -347,7 +347,7 @@ export class PuterHomepageService extends PuterService {
     <meta property="og:image" content="${e(socialImage)}">
 
     <meta name="twitter:card" content="summary_large_image">
-    <meta property="twitter:domain" content="puter.com">
+    <meta property="twitter:domain" content="${e(String(this.config.domain ?? 'puter.com'))}">
     <meta property="twitter:url" content="${e(canonical)}">
     <meta name="twitter:title" content="${e(title)}">
     <meta name="twitter:description" content="${e(shortDescription.replace(/\n/g, ' ').trim())}">
@@ -362,17 +362,22 @@ export class PuterHomepageService extends PuterService {
     <link rel="apple-touch-icon" sizes="144x144" href="${assetDir}/favicons/apple-icon-144x144.png">
     <link rel="apple-touch-icon" sizes="152x152" href="${assetDir}/favicons/apple-icon-152x152.png">
     <link rel="apple-touch-icon" sizes="180x180" href="${assetDir}/favicons/apple-icon-180x180.png">
-    <link rel="icon" type="image/png" sizes="192x192" href="${assetDir}/favicons/android-icon-192x192.png">
+    ${
+        // A brand logo (gui_params.brand_logo_url) is the tab icon in place of Puter's favicons.
+        typeof guiParams.brand_logo_url === 'string' && guiParams.brand_logo_url
+            ? `<link rel="icon" href="${e(guiParams.brand_logo_url)}">`
+            : `<link rel="icon" type="image/png" sizes="192x192" href="${assetDir}/favicons/android-icon-192x192.png">
     <link rel="icon" type="image/png" sizes="32x32" href="${assetDir}/favicons/favicon-32x32.png">
     <link rel="icon" type="image/png" sizes="96x96" href="${assetDir}/favicons/favicon-96x96.png">
-    <link rel="icon" type="image/png" sizes="16x16" href="${assetDir}/favicons/favicon-16x16.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="${assetDir}/favicons/favicon-16x16.png">`
+    }
     <link rel="manifest" href="${assetDir}/manifest.json">
     <meta name="msapplication-TileColor" content="#ffffff">
     <meta name="msapplication-TileImage" content="${assetDir}/favicons/ms-icon-144x144.png">
     <meta name="theme-color" content="#ffffff">
     ${bundled ? `<link rel="stylesheet" href="${guiCss}">` : ''}
 
-    <link rel="preload" as="image" href="https://puter-assets.b-cdn.net/wallpaper.webp">
+    ${guiParams.brand_wallpaper_url ? '' : '<link rel="preload" as="image" href="https://puter-assets.b-cdn.net/wallpaper.webp">'}
 
     <script>
         if ( ! window.service_script ) {
